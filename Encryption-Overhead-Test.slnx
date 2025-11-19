@@ -1,0 +1,9 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="Client/Client.vcxproj" Id="e2c77e9f-e09c-4b61-8341-33543cdf9bd2" />
+  <Project Path="DataAnalyser/DataAnalyser.vcxproj" Id="a8d64a65-2e9f-44a0-980c-01a5c8cdfdce" />
+  <Project Path="Server/Server.vcxproj" Id="46f43407-7f1e-4da0-bdf0-ce03cbd21988" />
+</Solution>
