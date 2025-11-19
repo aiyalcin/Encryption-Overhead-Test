@@ -1,235 +1,101 @@
-// DataAnalyser.cpp : This file contains the 'main' function. Program execution begins and ends there.
-//
-
 #include <iostream>
 #include <fstream>
 #include <sstream>
 #include <string>
 #include <vector>
+#include <unordered_map>
 #include <algorithm>
 #include <cstdint>
 #include <cmath>
-#include <unordered_map>
+
+// Client CSV: pair_id,variant(0 plain 1 encrypted),plain_size,encrypted_size,encrypt_ns,send_ns,send_ts_us
+// Server CSV: pair_id,variant,plain_size,encrypted_size,recv_ts_us,payload_bytes
 
 struct ClientRow {
-    int id{};
-    bool encrypted{};
-    size_t plainSize{};
-    size_t encryptedSize{};
-    uint64_t encryptNs{};
-    uint64_t sendNs{};
-    uint64_t sendTsUs{}; // microseconds since epoch
-    bool parsed{false};
+    uint32_t pairId{}; uint8_t variant{}; uint32_t plainSize{}; uint32_t encryptedSize{}; uint64_t encryptNs{}; uint64_t sendNs{}; uint64_t sendTsUs{}; bool parsed{false};
 };
-
 struct ServerRow {
-    int id{};
-    bool encrypted{};
-    size_t sizeBytes{};
-    uint64_t recvTsUs{};
-    bool parsed{false};
+    uint32_t pairId{}; uint8_t variant{}; uint32_t plainSize{}; uint32_t encryptedSize{}; uint64_t recvTsUs{}; uint32_t payloadBytes{}; bool parsed{false};
 };
 
-struct Combined {
-    int id{};
-    bool encrypted{};
-    size_t plainSize{};
-    size_t encryptedSize{};
-    size_t serverSize{};
-    uint64_t encryptNs{};
-    uint64_t sendNs{};
-    uint64_t sendTsUs{};
-    uint64_t recvTsUs{};
-    int64_t latencyUs{}; // recv - send
-    uint32_t invalidFlags{}; // bitmask
-    std::string reasons;
+struct PairMetrics {
+    uint32_t pairId{};
+    // Plain
+    uint64_t plainSendTsUs{}; uint64_t plainRecvTsUs{}; int64_t plainLatencyUs{}; uint64_t plainSendNs{}; uint32_t plainSize{};
+    // Encrypted
+    uint64_t encSendTsUs{}; uint64_t encRecvTsUs{}; int64_t encLatencyUs{}; uint64_t encSendNs{}; uint32_t encPlainSize{}; uint32_t encEncryptedSize{}; uint64_t encEncryptNs{};
+    // Flags
+    uint32_t invalidFlags{}; std::string reasons;
+    // Derived deltas
+    int64_t latencyDeltaUs{}; // enc - plain
 };
 
 enum InvalidBits : uint32_t {
-    MISSING_CLIENT          = 1u << 0,
-    MISSING_SERVER          = 1u << 1,
-    FLAG_MISMATCH           = 1u << 2,
-    SIZE_MISMATCH           = 1u << 3,
-    NEGATIVE_LATENCY        = 1u << 4,
-    ZERO_SIZE               = 1u << 5,
-    ZERO_ENCRYPT_TIME       = 1u << 6,
-    ZERO_SEND_TIME          = 1u << 7,
-    DUPLICATE_ID_CLIENT     = 1u << 8,
-    DUPLICATE_ID_SERVER     = 1u << 9,
-    OUTLIER_LATENCY         = 1u << 10
+    MISSING_PLAIN_SEND      = 1u << 0,
+    MISSING_ENC_SEND        = 1u << 1,
+    MISSING_PLAIN_RECV      = 1u << 2,
+    MISSING_ENC_RECV        = 1u << 3,
+    SIZE_MISMATCH_PLAIN     = 1u << 4,
+    SIZE_MISMATCH_ENC       = 1u << 5,
+    ENCRYPT_SIZE_INVALID    = 1u << 6,
+    NEGATIVE_LAT_PLAIN      = 1u << 7,
+    NEGATIVE_LAT_ENC        = 1u << 8,
+    ZERO_ENCRYPT_TIME       = 1u << 9,
+    OUTLIER_LATENCY_PLAIN   = 1u << 10,
+    OUTLIER_LATENCY_ENC     = 1u << 11,
+    OUTLIER_DELTA           = 1u << 12
 };
 
 static std::vector<std::string> splitCSV(const std::string& line) {
-    std::vector<std::string> parts;
-    std::stringstream ss(line);
-    std::string item;
-    while (std::getline(ss, item, ',')) parts.push_back(item);
-    return parts;
+    std::vector<std::string> parts; std::stringstream ss(line); std::string item; while (std::getline(ss,item,',')) parts.push_back(item); return parts; }
+static bool toUInt32(const std::string&s,uint32_t&v){try{v=(uint32_t)std::stoul(s);return true;}catch(...){return false;}}
+static bool toUInt64(const std::string&s,uint64_t&v){try{v=(uint64_t)std::stoull(s);return true;}catch(...){return false;}}
+static bool toInt(const std::string&s,int&v){try{v=std::stoi(s);return true;}catch(...){return false;}}
+
+std::vector<ClientRow> loadClient(const std::string& path){std::ifstream in(path);std::vector<ClientRow> rows; if(!in.is_open()){std::cerr<<"Failed open client: "<<path<<"\n";return rows;} std::string line; bool header=true; while(std::getline(in,line)){ if(line.empty())continue; if(header){header=false;continue;} auto c=splitCSV(line); if(c.size()!=7)continue; ClientRow r; int var; if(!toUInt32(c[0],r.pairId))continue; if(!toInt(c[1],var))continue; r.variant=(uint8_t)var; if(!toUInt32(c[2],r.plainSize))continue; if(!toUInt32(c[3],r.encryptedSize))continue; if(!toUInt64(c[4],r.encryptNs))continue; if(!toUInt64(c[5],r.sendNs))continue; if(!toUInt64(c[6],r.sendTsUs))continue; r.parsed=true; rows.push_back(r);} return rows; }
+std::vector<ServerRow> loadServer(const std::string& path){std::ifstream in(path);std::vector<ServerRow> rows; if(!in.is_open()){std::cerr<<"Failed open server: "<<path<<"\n";return rows;} std::string line; bool header=true; while(std::getline(in,line)){ if(line.empty())continue; if(header){header=false;continue;} auto c=splitCSV(line); if(c.size()!=6)continue; ServerRow r; int var; if(!toUInt32(c[0],r.pairId))continue; if(!toInt(c[1],var))continue; r.variant=(uint8_t)var; if(!toUInt32(c[2],r.plainSize))continue; if(!toUInt32(c[3],r.encryptedSize))continue; if(!toUInt64(c[4],r.recvTsUs))continue; if(!toUInt32(c[5],r.payloadBytes))continue; r.parsed=true; rows.push_back(r);} return rows; }
+
+void buildPairs(const std::vector<ClientRow>& cRows, const std::vector<ServerRow>& sRows, std::vector<PairMetrics>& out){
+    // Organize by pairId & variant
+    std::unordered_map<uint64_t,ClientRow> cPlain,cEnc; std::unordered_map<uint64_t,ServerRow> sPlain,sEnc;
+    for(auto const& c: cRows){ if(!c.parsed) continue; if(c.variant==0) cPlain[c.pairId]=c; else if(c.variant==1) cEnc[c.pairId]=c; }
+    for(auto const& s: sRows){ if(!s.parsed) continue; if(s.variant==0) sPlain[s.pairId]=s; else if(s.variant==1) sEnc[s.pairId]=s; }
+    // build union of pairIds
+    std::unordered_map<uint64_t,bool> ids; for(auto& kv:cPlain) ids[kv.first]=true; for(auto& kv:cEnc) ids[kv.first]=true; for(auto& kv:sPlain) ids[kv.first]=true; for(auto& kv:sEnc) ids[kv.first]=true;
+    out.reserve(ids.size());
+    for(auto& kv: ids){ uint64_t id=kv.first; PairMetrics pm{}; pm.pairId=(uint32_t)id;
+        bool hcP = cPlain.count(id); bool hcE = cEnc.count(id); bool hsP = sPlain.count(id); bool hsE = sEnc.count(id);
+        if(hcP){ auto &c=cPlain[id]; pm.plainSendTsUs=c.sendTsUs; pm.plainSendNs=c.sendNs; pm.plainSize=c.plainSize; }
+        else pm.invalidFlags |= MISSING_PLAIN_SEND;
+        if(hcE){ auto &c=cEnc[id]; pm.encSendTsUs=c.sendTsUs; pm.encSendNs=c.sendNs; pm.encPlainSize=c.plainSize; pm.encEncryptedSize=c.encryptedSize; pm.encEncryptNs=c.encryptNs; }
+        else pm.invalidFlags |= MISSING_ENC_SEND;
+        if(hsP){ auto &s=sPlain[id]; pm.plainRecvTsUs=s.recvTsUs; }
+        else pm.invalidFlags |= MISSING_PLAIN_RECV;
+        if(hsE){ auto &s=sEnc[id]; pm.encRecvTsUs=s.recvTsUs; }
+        else pm.invalidFlags |= MISSING_ENC_RECV;
+        if(hcP && hsP){ pm.plainLatencyUs = (int64_t)pm.plainRecvTsUs - (int64_t)pm.plainSendTsUs; if(pm.plainLatencyUs < 0) pm.invalidFlags |= NEGATIVE_LAT_PLAIN; }
+        if(hcE && hsE){ pm.encLatencyUs = (int64_t)pm.encRecvTsUs - (int64_t)pm.encSendTsUs; if(pm.encLatencyUs < 0) pm.invalidFlags |= NEGATIVE_LAT_ENC; }
+        if(hcP && hsP){ if(pm.plainSize==0) pm.invalidFlags |= SIZE_MISMATCH_PLAIN; }
+        if(hcE && hsE){ if(pm.encEncryptedSize==0 || pm.encPlainSize==0) pm.invalidFlags |= ENCRYPT_SIZE_INVALID; else if(pm.encEncryptedSize < pm.encPlainSize) pm.invalidFlags |= SIZE_MISMATCH_ENC; if(pm.encEncryptNs==0) pm.invalidFlags |= ZERO_ENCRYPT_TIME; }
+        if(hcP && hcE){ pm.latencyDeltaUs = pm.encLatencyUs - pm.plainLatencyUs; }
+        out.push_back(pm); }
 }
 
-static bool toUInt64(const std::string& s, uint64_t& v) { try { v = static_cast<uint64_t>(std::stoull(s)); return true; } catch (...) { return false; } }
-static bool toSize(const std::string& s, size_t& v) { try { v = static_cast<size_t>(std::stoull(s)); return true; } catch (...) { return false; } }
-static bool toInt(const std::string& s, int& v) { try { v = std::stoi(s); return true; } catch (...) { return false; } }
-
-std::vector<ClientRow> loadClient(const std::string& path) {
-    std::ifstream in(path);
-    std::vector<ClientRow> rows;
-    if (!in.is_open()) { std::cerr << "Failed to open client CSV: " << path << "\n"; return rows; }
-    std::string line; bool header = true; std::unordered_map<int,int> idCount;
-    while (std::getline(in, line)) {
-        if (line.empty()) continue; if (header) { header = false; continue; }
-        auto cols = splitCSV(line); if (cols.size() != 7) continue;
-        ClientRow r; int encInt;
-        if (!toInt(cols[0], r.id)) continue;
-        if (!toInt(cols[1], encInt)) continue; r.encrypted = (encInt == 1);
-        if (!toSize(cols[2], r.plainSize)) continue;
-        if (!toSize(cols[3], r.encryptedSize)) continue;
-        if (!toUInt64(cols[4], r.encryptNs)) continue;
-        if (!toUInt64(cols[5], r.sendNs)) continue;
-        if (!toUInt64(cols[6], r.sendTsUs)) continue;
-        r.parsed = true; idCount[r.id]++;
-        rows.push_back(r);
-    }
-    // Mark duplicates by setting sendNs=0 (will flag) not altering structure, flags handled later
-    return rows;
+static void detectOutliers(std::vector<PairMetrics>& rows){
+    std::vector<int64_t> plainL, encL, deltas; plainL.reserve(rows.size()); encL.reserve(rows.size()); deltas.reserve(rows.size());
+    for(auto &r: rows){ if(!(r.invalidFlags & (MISSING_PLAIN_SEND|MISSING_PLAIN_RECV|NEGATIVE_LAT_PLAIN)) && r.plainLatencyUs>0) plainL.push_back(r.plainLatencyUs); if(!(r.invalidFlags & (MISSING_ENC_SEND|MISSING_ENC_RECV|NEGATIVE_LAT_ENC)) && r.encLatencyUs>0) encL.push_back(r.encLatencyUs); if(r.invalidFlags==0 && r.plainLatencyUs>0 && r.encLatencyUs>0) deltas.push_back(r.latencyDeltaUs); }
+    auto mark = [](std::vector<PairMetrics>& rows, const std::vector<int64_t>& values, uint32_t flag, auto accessor){ if(values.size()<8) return; std::vector<int64_t> tmp=values; std::nth_element(tmp.begin(), tmp.begin()+tmp.size()/2, tmp.end()); double med=(double)tmp[tmp.size()/2]; std::vector<double> dev; dev.reserve(values.size()); for(auto v: values) dev.push_back(std::abs(v-med)); std::nth_element(dev.begin(), dev.begin()+dev.size()/2, dev.end()); double mad=dev[dev.size()/2]; if(mad<1) mad=1; double thr=6.0*mad; for(auto &r: rows){ double val=(double)accessor(r); if(val>0){ double diff=std::abs(val-med); if(diff>thr) r.invalidFlags |= flag; } } };
+    mark(rows, plainL, OUTLIER_LATENCY_PLAIN, [](const PairMetrics&r){return r.plainLatencyUs;});
+    mark(rows, encL, OUTLIER_LATENCY_ENC, [](const PairMetrics&r){return r.encLatencyUs;});
+    mark(rows, deltas, OUTLIER_DELTA, [](const PairMetrics&r){return r.latencyDeltaUs;});
 }
 
-std::vector<ServerRow> loadServer(const std::string& path) {
-    std::ifstream in(path);
-    std::vector<ServerRow> rows;
-    if (!in.is_open()) { std::cerr << "Failed to open server CSV: " << path << "\n"; return rows; }
-    std::string line; bool header = true; std::unordered_map<int,int> idCount;
-    while (std::getline(in, line)) {
-        if (line.empty()) continue; if (header) { header = false; continue; }
-        auto cols = splitCSV(line); if (cols.size() != 4) continue;
-        ServerRow r; int encInt;
-        if (!toInt(cols[0], r.id)) continue;
-        if (!toInt(cols[1], encInt)) continue; r.encrypted = (encInt == 1);
-        if (!toSize(cols[2], r.sizeBytes)) continue;
-        if (!toUInt64(cols[3], r.recvTsUs)) continue;
-        r.parsed = true; idCount[r.id]++;
-        rows.push_back(r);
-    }
-    return rows;
+static void assembleReasons(std::vector<PairMetrics>& rows){ for(auto &r: rows){ std::vector<std::string> rs; if(r.invalidFlags & MISSING_PLAIN_SEND) rs.push_back("missing_plain_send"); if(r.invalidFlags & MISSING_ENC_SEND) rs.push_back("missing_enc_send"); if(r.invalidFlags & MISSING_PLAIN_RECV) rs.push_back("missing_plain_recv"); if(r.invalidFlags & MISSING_ENC_RECV) rs.push_back("missing_enc_recv"); if(r.invalidFlags & SIZE_MISMATCH_PLAIN) rs.push_back("size_mismatch_plain"); if(r.invalidFlags & SIZE_MISMATCH_ENC) rs.push_back("size_mismatch_enc"); if(r.invalidFlags & ENCRYPT_SIZE_INVALID) rs.push_back("encrypt_size_invalid"); if(r.invalidFlags & NEGATIVE_LAT_PLAIN) rs.push_back("negative_latency_plain"); if(r.invalidFlags & NEGATIVE_LAT_ENC) rs.push_back("negative_latency_enc"); if(r.invalidFlags & ZERO_ENCRYPT_TIME) rs.push_back("zero_encrypt_time"); if(r.invalidFlags & OUTLIER_LATENCY_PLAIN) rs.push_back("outlier_latency_plain"); if(r.invalidFlags & OUTLIER_LATENCY_ENC) rs.push_back("outlier_latency_enc"); if(r.invalidFlags & OUTLIER_DELTA) rs.push_back("outlier_delta"); r.reasons.clear(); for(size_t i=0;i<rs.size();++i){ if(i) r.reasons+=';'; r.reasons+=rs[i]; } } }
+
+struct Stats { double count{}; double min{}; double max{}; double mean{}; double median{}; double stddev{}; };
+static Stats computeStats(const std::vector<int64_t>& v){ Stats s; if(v.empty()) return s; s.count=(double)v.size(); s.min=*std::min_element(v.begin(),v.end()); s.max=*std::max_element(v.begin(),v.end()); double sum=0; for(auto x:v) sum+=x; s.mean=sum/s.count; std::vector<int64_t> tmp=v; std::nth_element(tmp.begin(), tmp.begin()+tmp.size()/2, tmp.end()); s.median=(double)tmp[tmp.size()/2]; double acc=0; for(auto x:v){ double d=x - s.mean; acc+=d*d;} s.stddev=std::sqrt(acc/s.count); return s; }
+
+static void writeOutputs(const std::vector<PairMetrics>& rows){ std::ofstream valid("paired_filtered.csv"), invalid("paired_invalid.csv"), summary("paired_summary.txt"); if(!valid.is_open()||!invalid.is_open()){ std::cerr<<"Failed open output files"<<std::endl; return;} valid<<"pair_id,plain_latency_us,enc_latency_us,latency_delta_us,plain_size,enc_plain_size,enc_encrypted_size,encrypt_ns,plain_send_ns,enc_send_ns\n"; invalid<<"pair_id,plain_latency_us,enc_latency_us,latency_delta_us,invalid_flags,reasons\n"; std::vector<int64_t> plainL, encL, deltaL; for(auto &r: rows){ if(r.invalidFlags==0){ valid<<r.pairId<<","<<r.plainLatencyUs<<","<<r.encLatencyUs<<","<<r.latencyDeltaUs<<","<<r.plainSize<<","<<r.encPlainSize<<","<<r.encEncryptedSize<<","<<r.encEncryptNs<<","<<r.plainSendNs<<","<<r.encSendNs<<"\n"; if(r.plainLatencyUs>0) plainL.push_back(r.plainLatencyUs); if(r.encLatencyUs>0) encL.push_back(r.encLatencyUs); if(r.latencyDeltaUs) deltaL.push_back(r.latencyDeltaUs);} else { invalid<<r.pairId<<","<<r.plainLatencyUs<<","<<r.encLatencyUs<<","<<r.latencyDeltaUs<<","<<r.invalidFlags<<","<<r.reasons<<"\n"; } } Stats sp=computeStats(plainL), se=computeStats(encL), sd=computeStats(deltaL); if(summary.is_open()){ summary<<"Valid pairs: "<<(int)sp.count<<"\n"; summary<<"Plain latency us: min="<<sp.min<<" max="<<sp.max<<" mean="<<sp.mean<<" median="<<sp.median<<" stddev="<<sp.stddev<<"\n"; summary<<"Encrypted latency us: min="<<se.min<<" max="<<se.max<<" mean="<<se.mean<<" median="<<se.median<<" stddev="<<se.stddev<<"\n"; summary<<"Delta (enc-plain) us: min="<<sd.min<<" max="<<sd.max<<" mean="<<sd.mean<<" median="<<sd.median<<" stddev="<<sd.stddev<<"\n"; summary<<"Mean overhead (enc - plain): "<<se.mean - sp.mean<<" us\n"; }
 }
 
-void markDuplicates(const std::vector<ClientRow>& client, const std::vector<ServerRow>& server,
-                    std::unordered_map<int,uint32_t>& clientFlags,
-                    std::unordered_map<int,uint32_t>& serverFlags) {
-    std::unordered_map<int,int> countsC; for (auto& c : client) countsC[c.id]++;
-    for (auto& kv : countsC) if (kv.second > 1) clientFlags[kv.first] |= DUPLICATE_ID_CLIENT;
-    std::unordered_map<int,int> countsS; for (auto& s : server) countsS[s.id]++;
-    for (auto& kv : countsS) if (kv.second > 1) serverFlags[kv.first] |= DUPLICATE_ID_SERVER;
-}
-
-std::vector<Combined> mergeAndValidate(const std::vector<ClientRow>& client, const std::vector<ServerRow>& server) {
-    std::unordered_map<int, ClientRow> cMap; for (auto const& c : client) if (c.parsed) cMap[c.id] = c;
-    std::unordered_map<int, ServerRow> sMap; for (auto const& s : server) if (s.parsed) sMap[s.id] = s;
-    std::unordered_map<int,uint32_t> cFlags; std::unordered_map<int,uint32_t> sFlags; markDuplicates(client, server, cFlags, sFlags);
-
-    std::unordered_map<int,bool> allIds; for (auto& c : client) allIds[c.id] = true; for (auto& s : server) allIds[s.id] = true;
-    std::vector<Combined> out; out.reserve(allIds.size());
-
-    for (auto& kv : allIds) {
-        int id = kv.first; Combined comb{}; comb.id = id;
-        bool hasC = cMap.find(id) != cMap.end(); bool hasS = sMap.find(id) != sMap.end();
-        if (!hasC) comb.invalidFlags |= MISSING_CLIENT; if (!hasS) comb.invalidFlags |= MISSING_SERVER;
-        if (hasC) {
-            const auto& c = cMap[id]; comb.encrypted = c.encrypted; comb.plainSize = c.plainSize; comb.encryptedSize = c.encryptedSize;
-            comb.encryptNs = c.encryptNs; comb.sendNs = c.sendNs; comb.sendTsUs = c.sendTsUs;
-            if (cFlags.count(id)) comb.invalidFlags |= cFlags[id];
-            if (c.encrypted && c.encryptNs == 0) comb.invalidFlags |= ZERO_ENCRYPT_TIME;
-            if (c.sendNs == 0) comb.invalidFlags |= ZERO_SEND_TIME;
-            if (!c.encrypted && c.encryptedSize != c.plainSize) comb.invalidFlags |= SIZE_MISMATCH;
-            if ((c.encrypted ? c.encryptedSize : c.plainSize) == 0) comb.invalidFlags |= ZERO_SIZE;
-        }
-        if (hasS) { const auto& s = sMap[id]; comb.serverSize = s.sizeBytes; comb.recvTsUs = s.recvTsUs; if (sFlags.count(id)) comb.invalidFlags |= sFlags[id]; }
-        if (hasC && hasS) {
-            size_t expectedSentSize = comb.encrypted ? comb.encryptedSize : comb.plainSize;
-            if (expectedSentSize != comb.serverSize) comb.invalidFlags |= SIZE_MISMATCH;
-            comb.latencyUs = static_cast<int64_t>(comb.recvTsUs) - static_cast<int64_t>(comb.sendTsUs);
-            if (comb.latencyUs < 0) comb.invalidFlags |= NEGATIVE_LATENCY;
-        }
-        out.push_back(comb);
-    }
-    return out;
-}
-
-void detectLatencyOutliers(std::vector<Combined>& rows) {
-    std::vector<int64_t> latencies; latencies.reserve(rows.size());
-    for (auto& r : rows) if ((r.invalidFlags & (MISSING_CLIENT | MISSING_SERVER | NEGATIVE_LATENCY)) == 0) latencies.push_back(r.latencyUs);
-    if (latencies.size() < 8) return;
-    std::vector<int64_t> tmp = latencies; std::nth_element(tmp.begin(), tmp.begin() + tmp.size()/2, tmp.end()); double median = (double)tmp[tmp.size()/2];
-    std::vector<double> dev; dev.reserve(latencies.size()); for (auto v : latencies) dev.push_back(std::abs(v - median));
-    std::nth_element(dev.begin(), dev.begin() + dev.size()/2, dev.end()); double mad = dev[dev.size()/2]; if (mad < 1) mad = 1; double threshold = 6.0 * mad;
-    for (auto& r : rows) {
-        if (r.invalidFlags) continue; double diff = std::abs((double)r.latencyUs - median); if (diff > threshold) r.invalidFlags |= OUTLIER_LATENCY;
-    }
-}
-
-void assembleReasons(std::vector<Combined>& rows) {
-    for (auto& r : rows) {
-        std::vector<std::string> reasons;
-        if (r.invalidFlags & MISSING_CLIENT) reasons.emplace_back("missing_client");
-        if (r.invalidFlags & MISSING_SERVER) reasons.emplace_back("missing_server");
-        if (r.invalidFlags & FLAG_MISMATCH) reasons.emplace_back("flag_mismatch");
-        if (r.invalidFlags & SIZE_MISMATCH) reasons.emplace_back("size_mismatch");
-        if (r.invalidFlags & NEGATIVE_LATENCY) reasons.emplace_back("negative_latency");
-        if (r.invalidFlags & ZERO_SIZE) reasons.emplace_back("zero_size");
-        if (r.invalidFlags & ZERO_ENCRYPT_TIME) reasons.emplace_back("zero_encrypt_time");
-        if (r.invalidFlags & ZERO_SEND_TIME) reasons.emplace_back("zero_send_time");
-        if (r.invalidFlags & DUPLICATE_ID_CLIENT) reasons.emplace_back("duplicate_id_client");
-        if (r.invalidFlags & DUPLICATE_ID_SERVER) reasons.emplace_back("duplicate_id_server");
-        if (r.invalidFlags & OUTLIER_LATENCY) reasons.emplace_back("outlier_latency");
-        r.reasons.clear(); for (size_t i=0;i<reasons.size();++i) { if (i) r.reasons += ';'; r.reasons += reasons[i]; }
-    }
-}
-
-struct Stats { double count{}; double min{}; double max{}; double mean{}; double stddev{}; double median{}; };
-
-Stats computeStats(const std::vector<int64_t>& values) {
-    Stats s{}; if (values.empty()) return s; s.count = (double)values.size();
-    s.min = (double)*std::min_element(values.begin(), values.end()); s.max = (double)*std::max_element(values.begin(), values.end());
-    double sum=0; for (auto v:values) sum+=v; s.mean=sum/s.count; std::vector<int64_t> tmp=values; std::nth_element(tmp.begin(), tmp.begin()+tmp.size()/2, tmp.end()); s.median=(double)tmp[tmp.size()/2];
-    double acc=0; for (auto v:values){ double d=v - s.mean; acc += d*d; } s.stddev = std::sqrt(acc / s.count); return s;
-}
-
-void writeOutputs(const std::vector<Combined>& rows) {
-    std::ofstream validOut("filtered_results.csv"); std::ofstream invalidOut("invalid_results.csv");
-    if (!validOut.is_open() || !invalidOut.is_open()) { std::cerr << "Failed opening output CSV files.\n"; return; }
-    validOut << "id,encrypted,plain_size,encrypted_size,server_size,encrypt_ns,send_ns,send_ts_us,recv_ts_us,latency_us\n";
-    invalidOut << "id,encrypted,plain_size,encrypted_size,server_size,encrypt_ns,send_ns,send_ts_us,recv_ts_us,latency_us,invalid_flags,reasons\n";
-    std::vector<int64_t> latEnc, latPlain;
-    for (auto const& r : rows) {
-        if (r.invalidFlags == 0) {
-            validOut << r.id << ',' << (r.encrypted?1:0) << ',' << r.plainSize << ',' << r.encryptedSize << ',' << r.serverSize << ',' << r.encryptNs << ',' << r.sendNs << ',' << r.sendTsUs << ',' << r.recvTsUs << ',' << r.latencyUs << '\n';
-            (r.encrypted ? latEnc : latPlain).push_back(r.latencyUs);
-        } else {
-            invalidOut << r.id << ',' << (r.encrypted?1:0) << ',' << r.plainSize << ',' << r.encryptedSize << ',' << r.serverSize << ',' << r.encryptNs << ',' << r.sendNs << ',' << r.sendTsUs << ',' << r.recvTsUs << ',' << r.latencyUs << ',' << r.invalidFlags << ',' << r.reasons << '\n';
-        }
-    }
-    Stats sEnc = computeStats(latEnc); Stats sPlain = computeStats(latPlain);
-    std::ofstream summary("summary.txt");
-    if (summary.is_open()) {
-        summary << "Valid encrypted packets: " << (int)sEnc.count << "\n";
-        summary << "Encrypted latency (us): min=" << sEnc.min << " max=" << sEnc.max << " mean=" << sEnc.mean << " median=" << sEnc.median << " stddev=" << sEnc.stddev << "\n\n";
-        summary << "Valid plain packets: " << (int)sPlain.count << "\n";
-        summary << "Plain latency (us): min=" << sPlain.min << " max=" << sPlain.max << " mean=" << sPlain.mean << " median=" << sPlain.median << " stddev=" << sPlain.stddev << "\n\n";
-        summary << "Latency delta mean (enc - plain): " << (sEnc.mean - sPlain.mean) << " us\n";
-        summary << "Latency delta median (enc - plain): " << (sEnc.median - sPlain.median) << " us\n";
-    }
-}
-
-int main(int argc, char* argv[]) {
-    std::string clientPath = "overhead_metrics.csv";
-    std::string serverPath = "received_packets.csv";
-    if (argc > 1) clientPath = argv[1];
-    if (argc > 2) serverPath = argv[2];
-    std::cout << "Loading client metrics from: " << clientPath << "\n";
-    auto clientRows = loadClient(clientPath); std::cout << "Client rows parsed: " << clientRows.size() << "\n";
-    std::cout << "Loading server metrics from: " << serverPath << "\n";
-    auto serverRows = loadServer(serverPath); std::cout << "Server rows parsed: " << serverRows.size() << "\n";
-    auto merged = mergeAndValidate(clientRows, serverRows); detectLatencyOutliers(merged); assembleReasons(merged); writeOutputs(merged);
-    std::cout << "Analysis complete. See filtered_results.csv, invalid_results.csv, summary.txt\n";
-    return 0;
-}
+int main(int argc,char* argv[]){ std::string clientPath="client_metrics.csv", serverPath="server_metrics.csv"; if(argc>1) clientPath=argv[1]; if(argc>2) serverPath=argv[2]; std::cout<<"Loading client from "<<clientPath<<"\n"; auto cRows=loadClient(clientPath); std::cout<<"Client rows: "<<cRows.size()<<"\n"; std::cout<<"Loading server from "<<serverPath<<"\n"; auto sRows=loadServer(serverPath); std::cout<<"Server rows: "<<sRows.size()<<"\n"; std::vector<PairMetrics> pairs; buildPairs(cRows,sRows,pairs); detectOutliers(pairs); assembleReasons(pairs); writeOutputs(pairs); std::cout<<"Analysis complete. See paired_filtered.csv, paired_invalid.csv, paired_summary.txt\n"; return 0; }
