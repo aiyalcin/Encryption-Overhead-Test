@@ -7,62 +7,84 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+
+#ifdef __linux__
+// Linux / POSIX + OpenSSL headers
 #include <arpa/inet.h>
-#include <netinet/udp.h>
 #include <netinet/in.h>
+#include <netinet/udp.h>
 #include <sys/socket.h>
+#include <sys/select.h>
 #include <unistd.h>
 #include <openssl/pem.h>
 #include <openssl/rsa.h>
 #include <openssl/err.h>
+#else
+// Windows placeholder so project can compile in VS; real logic runs on Linux.
+#pragma warning(disable:4996)
+int main(){ std::cout<<"Client Linux implementation only. Run under Linux."<<std::endl; return 0; }
+#endif
 
-// Header magic constant 'PKTP'
-static const uint32_t HEADER_MAGIC = 0x504B5450u;
+#ifdef __linux__
+// -----------------------------------------------------------------------------
+// Protocol definitions
+// -----------------------------------------------------------------------------
+// Magic constant 'PKTP' identifying packet headers
+static const uint32_t HEADER_MAGIC = 0x504B5450u; // 'PKTP'
 
-// Packet variant codes
-// 0 = plain, 1 = encrypted, 2 = control
-enum Variant : uint8_t { PLAIN = 0, ENCRYPTED = 1, CONTROL = 2 };
+// Packet variant codes:
+// 0 = plain payload
+// 1 = encrypted payload
+// 2 = control (start test, announces parameters)
+// 3 = ack (server acknowledges control)
+enum Variant : uint8_t { PLAIN = 0, ENCRYPTED = 1, CONTROL = 2, ACK = 3 };
 
 #pragma pack(push,1)
 struct PacketHeader {
     uint32_t magic;        // HEADER_MAGIC
-    uint32_t pairId;       // pair identifier
-    uint8_t  variant;      // Variant code
-    uint8_t  reserved[3];  // padding
-    uint32_t plainSize;    // size of original plaintext
-    uint32_t encryptedSize;// size of encrypted payload (0 if plain/control)
-    uint32_t totalPairs;   // only meaningful for CONTROL, else 0
+    uint32_t pairId;       // For data: pair index. 0xFFFFFFFF for control / ack.
+    uint8_t  variant;      // See Variant enum
+    uint8_t  reserved[3];  // Padding / alignment
+    uint32_t plainSize;    // For data: size of original plaintext. For control: configured plaintext size.
+    uint32_t encryptedSize;// Size of encrypted payload (0 for plain/control/ack)
+    uint32_t totalPairs;   // Pairs per test (only meaningful in CONTROL / ACK)
+    uint32_t totalTests;   // Total number of tests (CONTROL / ACK)
+    uint32_t testIndex;    // 1-based test index (CONTROL / ACK). Echoed in data packets.
 };
 #pragma pack(pop)
 
+// Metrics recorded client-side per sent packet
 struct SendMetrics {
     uint32_t pairId;
-    uint8_t variant; // 0 plain 1 encrypted
+    uint8_t  variant;       // 0 plain, 1 encrypted
     uint32_t plainSize;
     uint32_t encryptedSize;
-    uint64_t encryptNs; // 0 for plain
-    uint64_t sendNs;
-    uint64_t sendTsUs; // microseconds since steady_clock epoch
+    uint64_t encryptNs;     // Encryption duration (ns), 0 for plain
+    uint64_t sendNs;        // sendto() duration (ns)
+    uint64_t sendTsUs;      // Send timestamp (microseconds since steady_clock epoch)
 };
 
-std::string loadFile(const std::string& path) {
+// -----------------------------------------------------------------------------
+// Utility helpers
+// -----------------------------------------------------------------------------
+static std::string loadFile(const std::string& path) {
     std::ifstream f(path);
     return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
 }
 
-RSA* load_public_key(const std::string& path) {
+static RSA* load_public_key(const std::string& path) {
     std::string pem = loadFile(path);
     BIO* bio = BIO_new_mem_buf(pem.data(), (int)pem.size());
     RSA* rsa = PEM_read_bio_RSA_PUBKEY(bio, nullptr, nullptr, nullptr);
     BIO_free(bio);
     if (!rsa) {
-        std::cerr << "Failed to load public key. OpenSSL error: " << ERR_error_string(ERR_get_error(), nullptr) << "\n";
+        std::cerr << "Failed to load public key: " << ERR_error_string(ERR_get_error(), nullptr) << "\n";
         std::exit(1);
     }
     return rsa;
 }
 
-std::vector<char> generate_payload(size_t size) {
+static std::vector<char> generate_payload(size_t size) {
     static std::mt19937 rng{ std::random_device{}() };
     std::uniform_int_distribution<int> dist(0, 255);
     std::vector<char> data(size);
@@ -70,7 +92,7 @@ std::vector<char> generate_payload(size_t size) {
     return data;
 }
 
-std::vector<char> encrypt_payload(const std::vector<char>& plain, RSA* rsa, uint64_t& durationNs) {
+static std::vector<char> encrypt_payload(const std::vector<char>& plain, RSA* rsa, uint64_t& durationNs) {
     auto t0 = std::chrono::steady_clock::now();
     int rsaSize = RSA_size(rsa);
     std::vector<unsigned char> out(rsaSize);
@@ -85,96 +107,200 @@ std::vector<char> encrypt_payload(const std::vector<char>& plain, RSA* rsa, uint
     return std::vector<char>(out.begin(), out.begin() + encLen);
 }
 
-void write_client_csv(const std::string& path, const std::vector<SendMetrics>& rows) {
+static void write_client_csv(const std::string& path, const std::vector<SendMetrics>& rows) {
     std::filesystem::create_directories(std::filesystem::path(path).parent_path());
     std::ofstream out(path);
-    if (!out.is_open()) { std::cerr << "Failed to open metrics file: " << path << "\n"; return; }
+    if (!out.is_open()) {
+        std::cerr << "Failed to open metrics file: " << path << "\n";
+        return;
+    }
     out << "pair_id,variant,plain_size,encrypted_size,encrypt_ns,send_ns,send_ts_us\n";
     for (auto const& r : rows) {
-        out << r.pairId << ',' << (int)r.variant << ',' << r.plainSize << ',' << r.encryptedSize << ','
-            << r.encryptNs << ',' << r.sendNs << ',' << r.sendTsUs << '\n';
+        out << r.pairId << ','
+            << (int)r.variant << ','
+            << r.plainSize << ','
+            << r.encryptedSize << ','
+            << r.encryptNs << ','
+            << r.sendNs << ','
+            << r.sendTsUs << '\n';
     }
-    std::cout << "Client metrics saved: " << rows.size() << " entries to " << path << "\n";
 }
 
-bool send_datagram(int sock, const sockaddr_in& dest, const char* data, size_t len, uint64_t& sendNs, uint64_t& sendTsUs) {
+static uint64_t nowMicros() {
+    auto t = std::chrono::steady_clock::now();
+    return std::chrono::duration_cast<std::chrono::microseconds>(t.time_since_epoch()).count();
+}
+
+static bool send_datagram(int sock, const sockaddr_in& dest, const char* data, size_t len, uint64_t& sendNs, uint64_t& sendTsUs) {
     auto t0 = std::chrono::steady_clock::now();
-    ssize_t sent = sendto(sock, data, len, 0, (const sockaddr*)&dest, sizeof(dest));
+    long sent = sendto(sock, data, (int)len, 0, (const sockaddr*)&dest, sizeof(dest));
     auto t1 = std::chrono::steady_clock::now();
-    if (sent < 0) { perror("sendto"); sendNs = 0; sendTsUs = 0; return false; }
+    if (sent < 0) {
+        perror("sendto");
+        sendNs = 0; sendTsUs = 0;
+        return false;
+    }
     sendNs = std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
-    sendTsUs = std::chrono::duration_cast<std::chrono::microseconds>(t1.time_since_epoch()).count();
+    sendTsUs = nowMicros();
     return true;
 }
 
+// Wait for an ACK packet matching expected test and total tests (with timeout)
+static bool wait_for_ack(int sock, int expectedTest, int expectedTotalTests, int timeoutMs) {
+    fd_set rfds; FD_ZERO(&rfds); FD_SET(sock, &rfds);
+    timeval tv{ timeoutMs / 1000, (timeoutMs % 1000) * 1000 };
+    int rc = select(sock + 1, &rfds, nullptr, nullptr, &tv);
+    if (rc <= 0) return false; // timeout / error
+
+    char buf[sizeof(PacketHeader)];
+    sockaddr_in src{}; socklen_t sl = sizeof(src);
+    int n = recvfrom(sock, buf, (int)sizeof(buf), 0, (sockaddr*)&src, &sl);
+    if (n < (int)sizeof(PacketHeader)) return false;
+
+    PacketHeader hdr; std::memcpy(&hdr, buf, sizeof(hdr));
+    if (hdr.magic != HEADER_MAGIC || hdr.variant != ACK) return false;
+    if ((int)hdr.testIndex != expectedTest || (int)hdr.totalTests != expectedTotalTests) return false;
+    return true;
+}
+
+// -----------------------------------------------------------------------------
+// Main program
+// -----------------------------------------------------------------------------
 int main() {
+    // User configuration
     int port = 8080;
     int pairCount = 50;
-    int plaintextBits = 1024; // user input bits
+    int plaintextBits = 1024;
+    int totalTests = 1;
     std::string targetIP;
-    std::string localIP = "127.0.0.1"; // set to appropriate local IP if needed
 
     std::cout << "Target IP (default 127.0.0.1): ";
     if (!(std::cin >> targetIP) || targetIP.empty()) targetIP = "127.0.0.1";
+
     std::cout << "UDP Port (default 8080): ";
     if (!(std::cin >> port) || port <= 0) port = 8080;
-    std::cout << "Number of pairs (default 50): ";
+
+    std::cout << "Pairs per test (default 50): ";
     if (!(std::cin >> pairCount) || pairCount <= 0) pairCount = 50;
-    std::cout << "Plaintext size bits (default 1024, max 1024): ";
+
+    std::cout << "Plaintext size bits (default 1024 max 1024): ";
     if (!(std::cin >> plaintextBits) || plaintextBits <= 0 || plaintextBits > 1024) plaintextBits = 1024;
 
+    std::cout << "Number of tests (default 1): ";
+    if (!(std::cin >> totalTests) || totalTests <= 0) totalTests = 1;
+
     size_t plainSizeBytes = plaintextBits / 8;
+    std::cout << "Running " << totalTests << " tests, each with " << pairCount << " pairs (plain + encrypted).\n";
 
-    std::cout << "Preparing to send " << pairCount << " pairs (plain + encrypted).\n";
-
-    // Load RSA public key once
+    // Load encryption key
     RSA* rsa = load_public_key("Keys/public.pem");
 
+    // Create UDP socket
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0) { perror("socket"); return 1; }
 
-    sockaddr_in dest{}; dest.sin_family = AF_INET; dest.sin_port = htons(port); dest.sin_addr.s_addr = inet_addr(targetIP.c_str());
+    sockaddr_in dest{};
+    dest.sin_family = AF_INET;
+    dest.sin_port = htons(port);
+    dest.sin_addr.s_addr = inet_addr(targetIP.c_str());
 
-    std::vector<SendMetrics> metrics; metrics.reserve(pairCount * 2 + 1);
+    // Iterate tests
+    for (int testIndex = 1; testIndex <= totalTests; ++testIndex) {
+        std::cout << "\n--- Test " << testIndex << "/" << totalTests << " ---" << std::endl;
 
-    // Send control packet
-    PacketHeader ctrl{}; ctrl.magic = HEADER_MAGIC; ctrl.pairId = 0xFFFFFFFFu; ctrl.variant = CONTROL; ctrl.plainSize = (uint32_t)plainSizeBytes; ctrl.encryptedSize = 0; ctrl.totalPairs = (uint32_t)pairCount;
-    uint64_t sendNs=0, sendTsUs=0;
-    send_datagram(sock, dest, reinterpret_cast<char*>(&ctrl), sizeof(ctrl), sendNs, sendTsUs);
-    std::cout << "Control packet sent.\n";
+        // Handshake: send control and wait for ACK (retry)
+        const int maxRetries = 5;
+        bool acked = false;
+        for (int attempt = 1; attempt <= maxRetries && !acked; ++attempt) {
+            PacketHeader ctrl{};
+            ctrl.magic        = HEADER_MAGIC;
+            ctrl.pairId       = 0xFFFFFFFFu;
+            ctrl.variant      = CONTROL;
+            ctrl.plainSize    = (uint32_t)plainSizeBytes;
+            ctrl.encryptedSize= 0;
+            ctrl.totalPairs   = (uint32_t)pairCount;
+            ctrl.totalTests   = (uint32_t)totalTests;
+            ctrl.testIndex    = (uint32_t)testIndex;
 
-    for (int pairId = 0; pairId < pairCount; ++pairId) {
-        // Generate plain payload once
-        std::vector<char> plain = generate_payload(plainSizeBytes);
+            uint64_t ctrlSendNs=0, ctrlSendTsUs=0;
+            send_datagram(sock, dest, reinterpret_cast<char*>(&ctrl), sizeof(ctrl), ctrlSendNs, ctrlSendTsUs);
+            std::cout << "Sent CONTROL (attempt " << attempt << ") waiting ACK..." << std::endl;
+            acked = wait_for_ack(sock, testIndex, totalTests, 1000); // 1s timeout
+            if (!acked) {
+                std::cout << "ACK timeout" << (attempt < maxRetries ? ", retrying..." : "; giving up") << std::endl;
+            }
+        }
+        if (!acked) {
+            std::cerr << "Skipping test " << testIndex << " (no ACK)." << std::endl;
+            continue;
+        }
+        std::cout << "ACK received. Sending data packets..." << std::endl;
 
-        // Encrypt copy
-        uint64_t encNs = 0;
-        std::vector<char> encrypted = encrypt_payload(plain, rsa, encNs);
+        std::vector<SendMetrics> metrics;
+        metrics.reserve(pairCount * 2);
 
-        // Prepare and send plain datagram
-        PacketHeader hPlain{}; hPlain.magic = HEADER_MAGIC; hPlain.pairId = (uint32_t)pairId; hPlain.variant = PLAIN; hPlain.plainSize = (uint32_t)plain.size(); hPlain.encryptedSize = 0; hPlain.totalPairs = 0;
-        std::vector<char> bufferPlain(sizeof(hPlain) + plain.size());
-        std::memcpy(bufferPlain.data(), &hPlain, sizeof(hPlain));
-        std::memcpy(bufferPlain.data() + sizeof(hPlain), plain.data(), plain.size());
-        uint64_t sendPlainNs=0, sendPlainTsUs=0;
-        send_datagram(sock, dest, bufferPlain.data(), bufferPlain.size(), sendPlainNs, sendPlainTsUs);
-        metrics.push_back({ (uint32_t)pairId, PLAIN, (uint32_t)plain.size(), 0, 0, sendPlainNs, sendPlainTsUs });
+        // Send packet pairs
+        for (int pairId = 0; pairId < pairCount; ++pairId) {
+            // Plain payload
+            auto plain = generate_payload(plainSizeBytes);
 
-        // Prepare and send encrypted datagram
-        PacketHeader hEnc{}; hEnc.magic = HEADER_MAGIC; hEnc.pairId = (uint32_t)pairId; hEnc.variant = ENCRYPTED; hEnc.plainSize = (uint32_t)plain.size(); hEnc.encryptedSize = (uint32_t)encrypted.size(); hEnc.totalPairs = 0;
-        std::vector<char> bufferEnc(sizeof(hEnc) + encrypted.size());
-        std::memcpy(bufferEnc.data(), &hEnc, sizeof(hEnc));
-        if (!encrypted.empty()) std::memcpy(bufferEnc.data() + sizeof(hEnc), encrypted.data(), encrypted.size());
-        uint64_t sendEncNs=0, sendEncTsUs=0;
-        send_datagram(sock, dest, bufferEnc.data(), bufferEnc.size(), sendEncNs, sendEncTsUs);
-        metrics.push_back({ (uint32_t)pairId, ENCRYPTED, (uint32_t)plain.size(), (uint32_t)encrypted.size(), encNs, sendEncNs, sendEncTsUs });
+            // Encrypted payload
+            uint64_t encNs = 0;
+            auto encrypted = encrypt_payload(plain, rsa, encNs);
 
-        std::cout << "Pair " << pairId+1 << "/" << pairCount << " sent. Plain bytes=" << plain.size() << ", Encrypted bytes=" << encrypted.size() << ", encNs=" << encNs << "\n";
+            // Plain packet header
+            PacketHeader hPlain{};
+            hPlain.magic        = HEADER_MAGIC;
+            hPlain.pairId       = (uint32_t)pairId;
+            hPlain.variant      = PLAIN;
+            hPlain.plainSize    = (uint32_t)plain.size();
+            hPlain.encryptedSize= 0;
+            hPlain.totalPairs   = 0;
+            hPlain.totalTests   = (uint32_t)totalTests;
+            hPlain.testIndex    = (uint32_t)testIndex;
+
+            std::vector<char> bufPlain(sizeof(hPlain) + plain.size());
+            std::memcpy(bufPlain.data(), &hPlain, sizeof(hPlain));
+            std::memcpy(bufPlain.data() + sizeof(hPlain), plain.data(), plain.size());
+            uint64_t sendPlainNs=0, sendPlainTsUs=0;
+            send_datagram(sock, dest, bufPlain.data(), bufPlain.size(), sendPlainNs, sendPlainTsUs);
+            metrics.push_back({ (uint32_t)pairId, PLAIN, (uint32_t)plain.size(), 0, 0, sendPlainNs, sendPlainTsUs });
+
+            // Encrypted packet header
+            PacketHeader hEnc{};
+            hEnc.magic         = HEADER_MAGIC;
+            hEnc.pairId        = (uint32_t)pairId;
+            hEnc.variant       = ENCRYPTED;
+            hEnc.plainSize     = (uint32_t)plain.size();
+            hEnc.encryptedSize = (uint32_t)encrypted.size();
+            hEnc.totalPairs    = 0;
+            hEnc.totalTests    = (uint32_t)totalTests;
+            hEnc.testIndex     = (uint32_t)testIndex;
+
+            std::vector<char> bufEnc(sizeof(hEnc) + encrypted.size());
+            std::memcpy(bufEnc.data(), &hEnc, sizeof(hEnc));
+            if (!encrypted.empty()) {
+                std::memcpy(bufEnc.data() + sizeof(hEnc), encrypted.data(), encrypted.size());
+            }
+            uint64_t sendEncNs=0, sendEncTsUs=0;
+            send_datagram(sock, dest, bufEnc.data(), bufEnc.size(), sendEncNs, sendEncTsUs);
+            metrics.push_back({ (uint32_t)pairId, ENCRYPTED, (uint32_t)plain.size(), (uint32_t)encrypted.size(), encNs, sendEncNs, sendEncTsUs });
+
+            std::cout << "Pair " << (pairId + 1) << "/" << pairCount
+                      << " plain=" << plain.size()
+                      << " enc=" << encrypted.size()
+                      << " encNs=" << encNs << std::endl;
+        }
+
+        // Write per-test metrics
+        std::string fileName = "data/client_metrics_t" + std::to_string(testIndex) + ".csv";
+        write_client_csv(fileName, metrics);
     }
 
-    write_client_csv("data/client_metrics.csv", metrics);
-
-    RSA_free(rsa);
+    // Cleanup
+    if (rsa) RSA_free(rsa);
     close(sock);
+    std::cout << "All requested tests processed." << std::endl;
     return 0;
 }
+#endif // __linux__
