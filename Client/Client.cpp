@@ -222,10 +222,10 @@ int main() {
             ctrl.totalTests   = (uint32_t)totalTests;
             ctrl.testIndex    = (uint32_t)testIndex;
 
-            uint64_t ctrlSendNs=0, ctrlSendTsUs=0;
-            send_datagram(sock, dest, reinterpret_cast<char*>(&ctrl), sizeof(ctrl), ctrlSendNs, ctrlSendTsUs);
+            uint64_t sns=0, sts=0;
+            send_datagram(sock, dest, reinterpret_cast<char*>(&ctrl), sizeof(ctrl), sns, sts);
             std::cout << "Sent CONTROL (attempt " << attempt << ") waiting ACK..." << std::endl;
-            acked = wait_for_ack(sock, testIndex, totalTests, 1000); // 1s timeout
+            acked = wait_for_ack(sock, testIndex, totalTests, 2000); // 2s timeout
             if (!acked) {
                 std::cout << "ACK timeout" << (attempt < maxRetries ? ", retrying..." : "; giving up") << std::endl;
             }
@@ -234,14 +234,13 @@ int main() {
             std::cerr << "Skipping test " << testIndex << " (no ACK)." << std::endl;
             continue;
         }
-        std::cout << "ACK received. Sending data packets..." << std::endl;
+        std::cout << "ACK received. Sending packet pairs..." << std::endl;
 
         std::vector<SendMetrics> metrics;
         metrics.reserve(pairCount * 2);
 
         // Send packet pairs
         for (int pairId = 0; pairId < pairCount; ++pairId) {
-            // Plain payload
             auto plain = generate_payload(plainSizeBytes);
 
             // Encrypted payload
@@ -295,6 +294,42 @@ int main() {
         // Write per-test metrics
         std::string fileName = "data/client_metrics_t" + std::to_string(testIndex) + ".csv";
         write_client_csv(fileName, metrics);
+
+        // --- WAIT FOR NEXT ACK OR TIMEOUT / RESEND CONTROL LOGIC HERE (STUB) ---
+        // Simple approach: after finishing a test, wait for next ack of next control;
+        // ensure not to start new test until ack received (already enforced).
+        // Optional pacing and detection stub; no change needed for next test start logic
+        // as it already waits for ack.
+
+        // ----------
+
+        // Optional: Basic pacing / retry detection (stub, not fully robust)
+        const int maxPaceRetries = 3;
+        for (int attempt = 1; attempt <= maxPaceRetries; ++attempt) {
+            std::cout << "Waiting for next ACK (attempt " << attempt << ")..." << std::flush;
+            bool gotAck = wait_for_ack(sock, testIndex + 1, totalTests, 2000);
+            if (gotAck) {
+                std::cout << "ACK received." << std::endl;
+                break;
+            }
+            std::cout << "no ACK, resending CONTROL..." << std::endl;
+
+            // Resend control packet (same as initial handshake)
+            PacketHeader ctrl{};
+            ctrl.magic        = HEADER_MAGIC;
+            ctrl.pairId       = 0xFFFFFFFFu;
+            ctrl.variant      = CONTROL;
+            ctrl.plainSize    = (uint32_t)plainSizeBytes;
+            ctrl.encryptedSize= 0;
+            ctrl.totalPairs   = (uint32_t)pairCount;
+            ctrl.totalTests   = (uint32_t)totalTests;
+            ctrl.testIndex    = (uint32_t)testIndex;
+
+            uint64_t sns=0, sts=0;
+            send_datagram(sock, dest, reinterpret_cast<char*>(&ctrl), sizeof(ctrl), sns, sts);
+            std::cout << "Resent CONTROL, waiting ACK..." << std::endl;
+            wait_for_ack(sock, testIndex, totalTests, 2000); // Wait for ACK (implicit retry limit)
+        }
     }
 
     // Cleanup

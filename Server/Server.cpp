@@ -101,6 +101,8 @@ int main(){
     int receivedPlain     = 0;
     int receivedEncrypted = 0;
     uint64_t testStartUs  = 0;
+    bool testActive       = false;
+    bool testTimedOut     = false;
     const int testTimeoutSec = 10; // seconds
 
     std::vector<ReceiveMetrics> metrics; // metrics for current test
@@ -141,6 +143,8 @@ int main(){
                 receivedPlain      = 0;
                 receivedEncrypted  = 0;
                 testStartUs        = recvUs;
+                testActive         = true;
+                testTimedOut       = false;
                 std::cout << "Control: start test " << currentTest << "/" << totalTests
                           << " expecting " << expectedPairs << " pairs" << std::endl;
             } else {
@@ -164,7 +168,7 @@ int main(){
             if(sent < 0) perror("sendto ACK"); else std::cout << "ACK sent for test " << currentTest << '\n';
 
             // If last test already finalized (expectedPairs==0 from timeout) exit
-            if(currentTest == totalTests && expectedPairs == 0) break;
+            if(currentTest == totalTests && expectedPairs == 0 && !testActive) break;
             continue; // Do not treat control as data
         }
 
@@ -179,18 +183,24 @@ int main(){
             uint64_t elapsedSec = (recvUs - testStartUs) / 1000000ull;
             if(elapsedSec > (uint64_t)testTimeoutSec){
                 std::cout << "Test " << currentTest << " timeout after " << elapsedSec
-                          << "s. Finalizing partial results." << std::endl;
-                std::string fn = "data/server_metrics_t" + std::to_string(currentTest) + ".csv";
-                write_server_csv(fn, metrics);
-                metrics.clear();
-                receivedPlain = receivedEncrypted = 0;
+                          << "s. Finalizing partial results and waiting for next control." << std::endl;
+                // Persist partial data
+                if(!metrics.empty()){
+                    std::string fn = "data/server_metrics_t" + std::to_string(currentTest) + ".csv";
+                    write_server_csv(fn, metrics);
+                    metrics.clear();
+                }
+                // Mark test inactive; ignore further data until next control
+                testActive = false;
+                testTimedOut = true;
                 expectedPairs = 0;
+                continue; // Do not record this late packet
             }
         }
 
         // Ignore packets for other tests (until their control arrives)
         if(hdr.testIndex != (uint32_t)currentTest){
-            std::cout << "Out-of-test packet testIndex=" << hdr.testIndex
+            std::cout << "Out-of-test data packet testIndex=" << hdr.testIndex
                       << " current=" << currentTest << " ignored" << std::endl;
             continue;
         }
@@ -214,15 +224,19 @@ int main(){
 
         // Completion condition
         if(expectedPairs > 0 && receivedPlain >= expectedPairs && receivedEncrypted >= expectedPairs){
-            std::cout << "Test " << currentTest << " complete" << std::endl;
-            std::string fn = "data/server_metrics_t" + std::to_string(currentTest) + ".csv";
-            write_server_csv(fn, metrics);
-            metrics.clear();
+            std::cout << "Test " << currentTest << " complete." << std::endl;
+            if(!metrics.empty()){
+                std::string fn = "data/server_metrics_t" + std::to_string(currentTest) + ".csv";
+                write_server_csv(fn, metrics);
+                metrics.clear();
+            }
+            testActive = false;
             expectedPairs = 0;
             if(currentTest == totalTests){
                 std::cout << "All tests done" << std::endl;
                 break;
             }
+            // Wait for next control; ignore interim data until control arrives
         }
     }
 
