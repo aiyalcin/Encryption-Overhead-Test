@@ -177,14 +177,8 @@ int main() {
     std::cout << "Target IP (default 127.0.0.1): ";
     if (!(std::cin >> targetIP) || targetIP.empty()) targetIP = "127.0.0.1";
 
-    std::cout << "UDP Port (default 8080): ";
-    if (!(std::cin >> port) || port <= 0) port = 8080;
-
     std::cout << "Pairs per test (default 50): ";
     if (!(std::cin >> pairCount) || pairCount <= 0) pairCount = 50;
-
-    std::cout << "Plaintext size bits (default 1024 max 1024): ";
-    if (!(std::cin >> plaintextBits) || plaintextBits <= 0 || plaintextBits > 1024) plaintextBits = 1024;
 
     std::cout << "Number of tests (default 1): ";
     if (!(std::cin >> totalTests) || totalTests <= 0) totalTests = 1;

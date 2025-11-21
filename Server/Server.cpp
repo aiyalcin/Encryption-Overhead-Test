@@ -80,8 +80,6 @@ static void write_server_csv(const std::string& path, const std::vector<ReceiveM
 int main(){
     // Configuration input
     int port = 8080;
-    std::cout << "Listen UDP port (default 8080): ";
-    if(!(std::cin >> port) || port <= 0) port = 8080;
 
     // UDP socket setup
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
