@@ -61,7 +61,7 @@ struct SendMetrics {
     uint32_t encryptedSize;
     uint64_t encryptNs;     // Encryption duration (ns), 0 for plain
     uint64_t sendNs;        // sendto() duration (ns)
-    uint64_t sendTsUs;      // Send timestamp (microseconds since steady_clock epoch)
+    uint64_t sendTsUs;      // Send timestamp (microseconds since UNIX epoch via system_clock)
 };
 
 // -----------------------------------------------------------------------------
@@ -126,8 +126,9 @@ static void write_client_csv(const std::string& path, const std::vector<SendMetr
     }
 }
 
+// Use system_clock so client/server share a common epoch (UNIX). Steady clock epochs differ per process.
 static uint64_t nowMicros() {
-    auto t = std::chrono::steady_clock::now();
+    auto t = std::chrono::system_clock::now();
     return std::chrono::duration_cast<std::chrono::microseconds>(t.time_since_epoch()).count();
 }
 
@@ -317,12 +318,16 @@ int main() {
             ctrl.encryptedSize= 0;
             ctrl.totalPairs   = (uint32_t)pairCount;
             ctrl.totalTests   = (uint32_t)totalTests;
-            ctrl.testIndex    = (uint32_t)testIndex;
+            ctrl.testIndex    = (uint32_t)testIndex + 1; // resend for next test, not current
 
             uint64_t sns=0, sts=0;
             send_datagram(sock, dest, reinterpret_cast<char*>(&ctrl), sizeof(ctrl), sns, sts);
             std::cout << "Resent CONTROL, waiting ACK..." << std::endl;
-            wait_for_ack(sock, testIndex, totalTests, 2000); // Wait for ACK (implicit retry limit)
+            bool ack = wait_for_ack(sock, testIndex + 1, totalTests, 2000);
+            if (ack) {
+                std::cout << "ACK received after resend." << std::endl;
+                break;
+            }
         }
     }
 

@@ -48,15 +48,16 @@ struct ReceiveMetrics {
     uint8_t  variant;       // 0 plain, 1 encrypted
     uint32_t plainSize;
     uint32_t encryptedSize;
-    uint64_t recvTsUs;      // Microseconds since steady_clock epoch
+    uint64_t recvTsUs;      // Microseconds since UNIX epoch (system_clock)
     uint32_t payloadBytes;  // Bytes excluding header
 };
 
 // -----------------------------------------------------------------------------
 // Utility functions
 // -----------------------------------------------------------------------------
+// Use system_clock to align with client timestamps for latency calculations.
 static uint64_t nowMicro(){
-    auto now = std::chrono::steady_clock::now();
+    auto now = std::chrono::system_clock::now();
     return std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()).count();
 }
 
@@ -69,8 +70,7 @@ static void write_server_csv(const std::string& path, const std::vector<ReceiveM
     }
     out << "pair_id,variant,plain_size,encrypted_size,recv_ts_us,payload_bytes\n";
     for(const auto& r : rows){
-        out << r.pairId << ',' << (int)r.variant << ',' << r.plainSize << ','
-            << r.encryptedSize << ',' << r.recvTsUs << ',' << r.payloadBytes << '\n';
+        out << r.pairId << ',' << (int)r.variant << ',' << r.plainSize << ',' << r.encryptedSize << ',' << r.recvTsUs << ',' << r.payloadBytes << '\n';
     }
 }
 
@@ -100,7 +100,6 @@ int main(){
     int receivedEncrypted = 0;
     uint64_t testStartUs  = 0;
     bool testActive       = false;
-    bool testTimedOut     = false;
     const int testTimeoutSec = 10; // seconds
 
     std::vector<ReceiveMetrics> metrics; // metrics for current test
@@ -142,7 +141,6 @@ int main(){
                 receivedEncrypted  = 0;
                 testStartUs        = recvUs;
                 testActive         = true;
-                testTimedOut       = false;
                 std::cout << "Control: start test " << currentTest << "/" << totalTests
                           << " expecting " << expectedPairs << " pairs" << std::endl;
             } else {
@@ -176,23 +174,19 @@ int main(){
             continue;
         }
 
-        // Timeout check for incomplete test
-        if(receivedPlain < expectedPairs || receivedEncrypted < expectedPairs){
-            uint64_t elapsedSec = (recvUs - testStartUs) / 1000000ull;
+        // Timeout -> finalize and if last test exit.
+        if(expectedPairs > 0 && (receivedPlain < expectedPairs || receivedEncrypted < expectedPairs)){
+            uint64_t elapsedSec = (recvUs - testStartUs)/1000000ull;
             if(elapsedSec > (uint64_t)testTimeoutSec){
-                std::cout << "Test " << currentTest << " timeout after " << elapsedSec
-                          << "s. Finalizing partial results and waiting for next control." << std::endl;
-                // Persist partial data
+                std::cout << "Test " << currentTest << " timeout after " << elapsedSec << "s. Finalizing." << std::endl;
                 if(!metrics.empty()){
                     std::string fn = "data/server_metrics_t" + std::to_string(currentTest) + ".csv";
                     write_server_csv(fn, metrics);
                     metrics.clear();
                 }
-                // Mark test inactive; ignore further data until next control
-                testActive = false;
-                testTimedOut = true;
-                expectedPairs = 0;
-                continue; // Do not record this late packet
+                expectedPairs=0; testActive=false;
+                if(currentTest == totalTests){ std::cout << "Last test timed out. Ending all tests." << std::endl; break; }
+                continue; // wait for next control
             }
         }
 
@@ -228,8 +222,8 @@ int main(){
                 write_server_csv(fn, metrics);
                 metrics.clear();
             }
-            testActive = false;
             expectedPairs = 0;
+            testActive = false;
             if(currentTest == totalTests){
                 std::cout << "All tests done" << std::endl;
                 break;
