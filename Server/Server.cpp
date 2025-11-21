@@ -24,9 +24,8 @@ int main(){ std::cout << "Server Linux implementation only. Run under Linux." <<
 // Protocol definitions
 // -----------------------------------------------------------------------------
 static const uint32_t HEADER_MAGIC = 0x504B5450u; // 'PKTP'
-// Variant codes
-// 0 plain data, 1 encrypted data, 2 control (start test), 3 ack (response to control)
-enum Variant : uint8_t { PLAIN = 0, ENCRYPTED = 1, CONTROL = 2, ACK = 3 };
+// Extend variants to include HASHED (4) and ENC_HASHED (5)
+enum Variant : uint8_t { PLAIN=0, ENCRYPTED=1, CONTROL=2, ACK=3, HASHED=4, ENC_HASHED=5 };
 
 #pragma pack(push,1)
 struct PacketHeader {
@@ -47,7 +46,7 @@ struct ReceiveMetrics {
     uint32_t pairId;
     uint8_t  variant;       // 0 plain, 1 encrypted
     uint32_t plainSize;
-    uint32_t encryptedSize;
+    uint32_t transformedSize;
     uint64_t recvTsUs;      // Microseconds since UNIX epoch (system_clock)
     uint32_t payloadBytes;  // Bytes excluding header
 };
@@ -68,9 +67,9 @@ static void write_server_csv(const std::string& path, const std::vector<ReceiveM
         std::cerr << "Failed to open server metrics file: " << path << "\n";
         return;
     }
-    out << "pair_id,variant,plain_size,encrypted_size,recv_ts_us,payload_bytes\n";
+    out << "pair_id,variant,plain_size,transformed_size,recv_ts_us,payload_bytes\n";
     for(const auto& r : rows){
-        out << r.pairId << ',' << (int)r.variant << ',' << r.plainSize << ',' << r.encryptedSize << ',' << r.recvTsUs << ',' << r.payloadBytes << '\n';
+        out << r.pairId << ',' << (int)r.variant << ',' << r.plainSize << ',' << r.transformedSize << ',' << r.recvTsUs << ',' << r.payloadBytes << '\n';
     }
 }
 
@@ -97,7 +96,7 @@ int main(){
     int totalTests        = 0;
     int expectedPairs     = 0;
     int receivedPlain     = 0;
-    int receivedEncrypted = 0;
+    int receivedOther     = 0;
     uint64_t testStartUs  = 0;
     bool testActive       = false;
     const int testTimeoutSec = 10; // seconds
@@ -107,7 +106,7 @@ int main(){
     // Receive loop
     while(true){
         // Receive datagram
-        char buf[8192];
+        char buf[16384];
         sockaddr_in src{}; socklen_t srclen = sizeof(src);
         int n = recvfrom(sock, buf, sizeof(buf), 0, (sockaddr*)&src, &srclen);
         if(n < 0){ perror("recvfrom"); break; }
@@ -138,7 +137,7 @@ int main(){
                 totalTests         = (int)hdr.totalTests;
                 expectedPairs      = (int)hdr.totalPairs;
                 receivedPlain      = 0;
-                receivedEncrypted  = 0;
+                receivedOther      = 0;
                 testStartUs        = recvUs;
                 testActive         = true;
                 std::cout << "Control: start test " << currentTest << "/" << totalTests
@@ -175,7 +174,7 @@ int main(){
         }
 
         // Timeout -> finalize and if last test exit.
-        if(expectedPairs > 0 && (receivedPlain < expectedPairs || receivedEncrypted < expectedPairs)){
+        if(expectedPairs > 0 && (receivedPlain < expectedPairs || receivedOther < expectedPairs)){
             uint64_t elapsedSec = (recvUs - testStartUs)/1000000ull;
             if(elapsedSec > (uint64_t)testTimeoutSec){
                 std::cout << "Test " << currentTest << " timeout after " << elapsedSec << "s. Finalizing." << std::endl;
@@ -202,20 +201,20 @@ int main(){
         rm.pairId        = hdr.pairId;
         rm.variant       = hdr.variant;
         rm.plainSize     = hdr.plainSize;
-        rm.encryptedSize = hdr.encryptedSize;
+        rm.transformedSize= hdr.encryptedSize;
         rm.recvTsUs      = recvUs;
         rm.payloadBytes  = (uint32_t)(n - sizeof(PacketHeader));
         metrics.push_back(rm);
         if(hdr.variant == PLAIN)      ++receivedPlain;
-        else if(hdr.variant == ENCRYPTED) ++receivedEncrypted;
+        else if(hdr.variant == ENCRYPTED || hdr.variant == HASHED || hdr.variant == ENC_HASHED) ++receivedOther;
 
         std::cout << "Test " << currentTest << " recv pairId=" << hdr.pairId
                   << " variant=" << (int)hdr.variant
                   << " (" << receivedPlain << "/" << expectedPairs << " plain, "
-                  << receivedEncrypted << "/" << expectedPairs << " enc)" << std::endl;
+                  << receivedOther << "/" << expectedPairs << " transformed)" << std::endl;
 
         // Completion condition
-        if(expectedPairs > 0 && receivedPlain >= expectedPairs && receivedEncrypted >= expectedPairs){
+        if(expectedPairs > 0 && receivedPlain >= expectedPairs && receivedOther >= expectedPairs){
             std::cout << "Test " << currentTest << " complete." << std::endl;
             if(!metrics.empty()){
                 std::string fn = "data/server_metrics_t" + std::to_string(currentTest) + ".csv";
@@ -235,4 +234,4 @@ int main(){
     close(sock);
     return 0;
 }
-#endif // __linux__
+#endif // __linux__#endif // __linux__
