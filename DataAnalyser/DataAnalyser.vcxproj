@@ -129,6 +129,14 @@
   <ItemGroup>
     <ClCompile Include="DataAnalyser.cpp" />
   </ItemGroup>
+  <ItemGroup>
+    <None Include="MetricData\client_metrics_t1.csv" />
+    <None Include="MetricData\client_metrics_t2.csv" />
+    <None Include="MetricData\client_metrics_t3.csv" />
+    <None Include="MetricData\server_metrics_t1.csv" />
+    <None Include="MetricData\server_metrics_t2.csv" />
+    <None Include="MetricData\server_metrics_t3.csv" />
+  </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>

@@ -12,7 +12,6 @@
 // Linux / POSIX networking + OpenSSL
 #include <arpa/inet.h>
 #include <netinet/in.h>
-#include <netinet/udp.h>
 #include <sys/socket.h>
 #include <sys/select.h>
 #include <unistd.h>
@@ -48,16 +47,11 @@ struct PacketHeader {
 };
 #pragma pack(pop)
 
-// Per-packet send metrics (client side)
+// Minimal per-packet send metrics (client side)
 struct SendMetrics {
     uint32_t pairId;
-    uint8_t  variant;          // PLAIN / ENCRYPTED / HASHED / ENC_HASHED
-    uint32_t plainSize;
-    uint32_t transformedSize;  // Size after encryption and/or hashing (extra payload portion)
-    uint64_t encryptNs;        // Encryption duration (ns), 0 if not encrypted
-    uint64_t hashNs;           // Hashing duration (ns), 0 if not hashed
-    uint64_t sendNs;           // sendto() syscall duration
-    uint64_t sendTsUs;         // Timestamp (system_clock, microseconds)
+    uint8_t  variant;      // Packet type
+    uint64_t sendTsUs;     // Timestamp (system_clock, microseconds)
 };
 
 // -----------------------------------------------------------------------------
@@ -88,24 +82,21 @@ static std::vector<char> generate_payload(size_t size) {
     return data;
 }
 
-static std::vector<char> encrypt_payload(const std::vector<char>& plain, RSA* rsa, uint64_t& durationNs) {
-    if (!rsa) { durationNs = 0; return {}; }
-    auto t0 = std::chrono::steady_clock::now();
+// Encryption without duration logging
+static std::vector<char> encrypt_payload(const std::vector<char>& plain, RSA* rsa) {
+    if (!rsa) { return {}; }
     int rsaSize = RSA_size(rsa);
     std::vector<unsigned char> out(rsaSize);
     int encLen = RSA_public_encrypt((int)plain.size(), reinterpret_cast<const unsigned char*>(plain.data()), out.data(), rsa, RSA_PKCS1_OAEP_PADDING);
-    auto t1 = std::chrono::steady_clock::now();
-    durationNs = std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
     if (encLen == -1) {
         std::cerr << "Encryption failed: " << ERR_error_string(ERR_get_error(), nullptr) << "\n";
-        durationNs = 0;
         return {};
     }
     return std::vector<char>(out.begin(), out.begin() + encLen);
 }
 
-static std::vector<unsigned char> hash_payload(const std::vector<char>& data, uint64_t& durationNs) {
-    auto t0 = std::chrono::steady_clock::now();
+// Hashing without duration logging
+static std::vector<unsigned char> hash_payload(const std::vector<char>& data) {
     EVP_MD_CTX* ctx = EVP_MD_CTX_new();
     const EVP_MD* md = EVP_sha256();
     std::vector<unsigned char> digest(EVP_MAX_MD_SIZE);
@@ -118,8 +109,6 @@ static std::vector<unsigned char> hash_payload(const std::vector<char>& data, ui
         dlen = 0;
     }
     EVP_MD_CTX_free(ctx);
-    auto t1 = std::chrono::steady_clock::now();
-    durationNs = std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
     digest.resize(dlen);
     return digest;
 }
@@ -131,15 +120,10 @@ static void write_client_csv(const std::string& path, const std::vector<SendMetr
         std::cerr << "Failed to open metrics file: " << path << "\n";
         return;
     }
-    out << "pair_id,variant,plain_size,transformed_size,encrypt_ns,hash_ns,send_ns,send_ts_us\n";
+    out << "pair_id,variant,send_ts_us\n";
     for (auto const& r : rows) {
         out << r.pairId << ','
             << (int)r.variant << ','
-            << r.plainSize << ','
-            << r.transformedSize << ','
-            << r.encryptNs << ','
-            << r.hashNs << ','
-            << r.sendNs << ','
             << r.sendTsUs << '\n';
     }
 }
@@ -150,18 +134,20 @@ static uint64_t nowMicros() {
 }
 
 static bool send_datagram(int sock, const sockaddr_in& dest, const char* data, size_t len,
-                          uint64_t& sendNs, uint64_t& sendTsUs) {
-    auto t0 = std::chrono::steady_clock::now();
+                          uint64_t& sendTsUs) {
     long sent = sendto(sock, data, (int)len, 0, (const sockaddr*)&dest, sizeof(dest));
-    auto t1 = std::chrono::steady_clock::now();
     if (sent < 0) {
         perror("sendto");
-        sendNs = 0; sendTsUs = 0;
+        sendTsUs = 0;
         return false;
     }
-    sendNs = std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
     sendTsUs = nowMicros();
     return true;
+}
+
+static inline bool send_datagram(int sock, const sockaddr_in& dest, const char* data, size_t len) {
+    uint64_t ts; // intentionally discarded
+    return send_datagram(sock, dest, data, len, ts);
 }
 
 static bool wait_for_ack(int sock, int expectedTest, int expectedTotalTests, int timeoutMs) {
@@ -242,8 +228,7 @@ int main() {
             ctrl.totalTests   = (uint32_t)totalTests;
             ctrl.testIndex    = (uint32_t)testIndex;
 
-            uint64_t sns = 0, sts = 0;
-            send_datagram(sock, dest, reinterpret_cast<char*>(&ctrl), sizeof(ctrl), sns, sts);
+            send_datagram(sock, dest, reinterpret_cast<char*>(&ctrl), sizeof(ctrl));
             std::cout << "Sent CONTROL (attempt " << attempt << ") waiting ACK..." << std::endl;
             acked = wait_for_ack(sock, testIndex, totalTests, 2000);
             if (!acked) {
@@ -277,40 +262,35 @@ int main() {
             std::vector<char> bufPlain(sizeof(hPlain) + plain.size());
             std::memcpy(bufPlain.data(), &hPlain, sizeof(hPlain));
             std::memcpy(bufPlain.data() + sizeof(hPlain), plain.data(), plain.size());
-            uint64_t sendPlainNs = 0, sendPlainTsUs = 0;
-            send_datagram(sock, dest, bufPlain.data(), bufPlain.size(), sendPlainNs, sendPlainTsUs);
-            metrics.push_back({ (uint32_t)pairId, PLAIN, (uint32_t)plain.size(), 0, 0, 0, sendPlainNs, sendPlainTsUs });
+            uint64_t sendPlainTsUs = 0;
+            send_datagram(sock, dest, bufPlain.data(), bufPlain.size(), sendPlainTsUs);
+            metrics.push_back({ (uint32_t)pairId, PLAIN, sendPlainTsUs });
+            std::cout << "Sent packet pairId=" << pairId << " variant=" << (int)PLAIN << " ts_us=" << sendPlainTsUs << std::endl;
 
             // Transformation depending on test mode
-            uint64_t encNs = 0, hashNs = 0;
             std::vector<char> transformed;
-            Variant v = modeVariant;
-            uint32_t transformedExtraSize = 0;
 
             if (modeVariant == ENCRYPTED) {
-                auto enc = encrypt_payload(plain, rsa, encNs);
+                auto enc = encrypt_payload(plain, rsa);
                 transformed = enc;
-                transformedExtraSize = (uint32_t)enc.size();
             } else if (modeVariant == HASHED) {
-                auto digest = hash_payload(plain, hashNs);
+                auto digest = hash_payload(plain);
                 transformed.assign((char*)digest.data(), (char*)digest.data() + digest.size());
-                transformedExtraSize = (uint32_t)digest.size();
             } else if (modeVariant == ENC_HASHED) {
-                auto enc = encrypt_payload(plain, rsa, encNs);
-                auto digest = hash_payload(plain, hashNs);
+                auto enc = encrypt_payload(plain, rsa);
+                auto digest = hash_payload(plain);
                 transformed.reserve(enc.size() + digest.size());
                 transformed.insert(transformed.end(), enc.begin(), enc.end());
                 transformed.insert(transformed.end(), (char*)digest.data(), (char*)digest.data() + digest.size());
-                transformedExtraSize = (uint32_t)(enc.size() + digest.size());
             }
 
             // Transformed packet header
             PacketHeader hTrans{};
             hTrans.magic         = HEADER_MAGIC;
             hTrans.pairId        = (uint32_t)pairId;
-            hTrans.variant       = v;
+            hTrans.variant       = modeVariant;
             hTrans.plainSize     = (uint32_t)plain.size();
-            hTrans.encryptedSize = transformedExtraSize;
+            hTrans.encryptedSize = (uint32_t)transformed.size();
             hTrans.totalPairs    = 0;
             hTrans.totalTests    = (uint32_t)totalTests;
             hTrans.testIndex     = (uint32_t)testIndex;
@@ -320,15 +300,10 @@ int main() {
             if (!transformed.empty()) {
                 std::memcpy(bufTrans.data() + sizeof(hTrans), transformed.data(), transformed.size());
             }
-            uint64_t sendTransNs = 0, sendTransTsUs = 0;
-            send_datagram(sock, dest, bufTrans.data(), bufTrans.size(), sendTransNs, sendTransTsUs);
-            metrics.push_back({ (uint32_t)pairId, v, (uint32_t)plain.size(), transformedExtraSize, encNs, hashNs, sendTransNs, sendTransTsUs });
-
-            std::cout << "Pair " << (pairId + 1) << "/" << pairCount
-                      << " plain=" << plain.size()
-                      << " transformedExtra=" << transformedExtraSize
-                      << " encNs=" << encNs
-                      << " hashNs=" << hashNs << std::endl;
+            uint64_t sendTransTsUs = 0;
+            send_datagram(sock, dest, bufTrans.data(), bufTrans.size(), sendTransTsUs);
+            metrics.push_back({ (uint32_t)pairId, modeVariant, sendTransTsUs });
+            std::cout << "Sent packet pairId=" << pairId << " variant=" << (int)modeVariant << " ts_us=" << sendTransTsUs << std::endl;
         }
 
         // Persist metrics for this test
@@ -359,8 +334,7 @@ int main() {
             ctrl.totalTests   = (uint32_t)totalTests;
             ctrl.testIndex    = (uint32_t)testIndex + 1; // next test
 
-            uint64_t sns = 0, sts = 0;
-            send_datagram(sock, dest, reinterpret_cast<char*>(&ctrl), sizeof(ctrl), sns, sts);
+            send_datagram(sock, dest, reinterpret_cast<char*>(&ctrl), sizeof(ctrl));
             std::cout << "Resent CONTROL, waiting ACK..." << std::endl;
             bool ack = wait_for_ack(sock, testIndex + 1, totalTests, 2000);
             if (ack) {
