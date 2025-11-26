@@ -13,10 +13,33 @@
       <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
       <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav;mfcribbon-ms</Extensions>
     </Filter>
+    <Filter Include="DebugFiles">
+      <UniqueIdentifier>{ff408f89-3968-4f4c-8f8a-6d3889ec3107}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="DataAnalyser.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="MetricData\client_metrics_t1.csv">
+      <Filter>DebugFiles</Filter>
+    </None>
+    <None Include="MetricData\client_metrics_t2.csv">
+      <Filter>DebugFiles</Filter>
+    </None>
+    <None Include="MetricData\client_metrics_t3.csv">
+      <Filter>DebugFiles</Filter>
+    </None>
+    <None Include="MetricData\server_metrics_t1.csv">
+      <Filter>DebugFiles</Filter>
+    </None>
+    <None Include="MetricData\server_metrics_t2.csv">
+      <Filter>DebugFiles</Filter>
+    </None>
+    <None Include="MetricData\server_metrics_t3.csv">
+      <Filter>DebugFiles</Filter>
+    </None>
   </ItemGroup>
 </Project>

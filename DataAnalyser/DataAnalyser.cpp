@@ -1,101 +1,233 @@
 #include <iostream>
 #include <fstream>
 #include <sstream>
-#include <string>
-#include <vector>
 #include <unordered_map>
-#include <algorithm>
+#include <unordered_set>
+#include <vector>
+#include <string>
 #include <cstdint>
-#include <cmath>
+#include <filesystem>
 
-// Client CSV: pair_id,variant(0 plain 1 encrypted),plain_size,encrypted_size,encrypt_ns,send_ns,send_ts_us
-// Server CSV: pair_id,variant,plain_size,encrypted_size,recv_ts_us,payload_bytes
+// -----------------------------------------------------------------------------
+// Simplified latency analyser for transformed vs plain packets.
+// Input CSVs (per test index T):
+//   data/client_metrics_tT.csv : pair_id,variant,send_ts_us
+//   data/server_metrics_tT.csv : pair_id,variant,recv_ts_us
+// Variants: 0=PLAIN, 1=ENCRYPTED, 4=HASHED, 5=ENC_HASHED
+// Output files per test:
+//   paired_filtered_tT.csv : pair_id,plain_latency_us,trans_latency_us,latency_delta_us,variant
+//   paired_invalid_tT.csv  : pair_id,reason
+// Summary: paired_summary.txt  (mean latencies and delta per test)
+// ----------------------------------------------------------------------------
 
-struct ClientRow {
-    uint32_t pairId{}; uint8_t variant{}; uint32_t plainSize{}; uint32_t encryptedSize{}; uint64_t encryptNs{}; uint64_t sendNs{}; uint64_t sendTsUs{}; bool parsed{false};
+// Variant constants
+static constexpr uint8_t VAR_PLAIN     = 0;
+static constexpr uint8_t VAR_ENCRYPTED = 1;
+static constexpr uint8_t VAR_HASHED    = 4;
+static constexpr uint8_t VAR_ENC_HASH  = 5;
+
+static inline bool isTransformed(uint8_t variant) {
+    return variant == VAR_ENCRYPTED || variant == VAR_HASHED || variant == VAR_ENC_HASH;
+}
+
+// Single CSV row (client or server)
+struct Row {
+    uint32_t id{};      // pair_id
+    uint8_t  variant{}; // variant
+    uint64_t timestampUs{};      // send or recv timestamp (us)
+    bool     ok{false}; // parsed status
 };
-struct ServerRow {
-    uint32_t pairId{}; uint8_t variant{}; uint32_t plainSize{}; uint32_t encryptedSize{}; uint64_t recvTsUs{}; uint32_t payloadBytes{}; bool parsed{false};
-};
 
+// Valid paired metrics
 struct PairMetrics {
-    uint32_t pairId{};
-    // Plain
-    uint64_t plainSendTsUs{}; uint64_t plainRecvTsUs{}; int64_t plainLatencyUs{}; uint64_t plainSendNs{}; uint32_t plainSize{};
-    // Encrypted
-    uint64_t encSendTsUs{}; uint64_t encRecvTsUs{}; int64_t encLatencyUs{}; uint64_t encSendNs{}; uint32_t encPlainSize{}; uint32_t encEncryptedSize{}; uint64_t encEncryptNs{};
-    // Flags
-    uint32_t invalidFlags{}; std::string reasons;
-    // Derived deltas
-    int64_t latencyDeltaUs{}; // enc - plain
+    uint32_t id;
+    uint64_t plainLatencyUs;
+    uint64_t transformedLatencyUs;
+    int64_t  deltaLatencyUs;       // transformed - plain
+    uint8_t  transformedVariant;   // transformed variant
 };
 
-enum InvalidBits : uint32_t {
-    MISSING_PLAIN_SEND      = 1u << 0,
-    MISSING_ENC_SEND        = 1u << 1,
-    MISSING_PLAIN_RECV      = 1u << 2,
-    MISSING_ENC_RECV        = 1u << 3,
-    SIZE_MISMATCH_PLAIN     = 1u << 4,
-    SIZE_MISMATCH_ENC       = 1u << 5,
-    ENCRYPT_SIZE_INVALID    = 1u << 6,
-    NEGATIVE_LAT_PLAIN      = 1u << 7,
-    NEGATIVE_LAT_ENC        = 1u << 8,
-    ZERO_ENCRYPT_TIME       = 1u << 9,
-    OUTLIER_LATENCY_PLAIN   = 1u << 10,
-    OUTLIER_LATENCY_ENC     = 1u << 11,
-    OUTLIER_DELTA           = 1u << 12
+// Invalid pair entry
+struct InvalidPair {
+    uint32_t id;
+    std::string reason;
 };
 
-static std::vector<std::string> splitCSV(const std::string& line) {
-    std::vector<std::string> parts; std::stringstream ss(line); std::string item; while (std::getline(ss,item,',')) parts.push_back(item); return parts; }
-static bool toUInt32(const std::string&s,uint32_t&v){try{v=(uint32_t)std::stoul(s);return true;}catch(...){return false;}}
-static bool toUInt64(const std::string&s,uint64_t&v){try{v=(uint64_t)std::stoull(s);return true;}catch(...){return false;}}
-static bool toInt(const std::string&s,int&v){try{v=std::stoi(s);return true;}catch(...){return false;}}
+// Parsed input collections for a test
+struct TestData {
+    std::unordered_map<uint32_t, Row> clientPlainRows;
+    std::unordered_map<uint32_t, Row> clientTransformedRows;
+    std::unordered_map<uint32_t, Row> serverPlainRows;
+    std::unordered_map<uint32_t, Row> serverTransformedRows;
+};
 
-std::vector<ClientRow> loadClient(const std::string& path){std::ifstream in(path);std::vector<ClientRow> rows; if(!in.is_open()){std::cerr<<"Failed open client: "<<path<<"\n";return rows;} std::string line; bool header=true; while(std::getline(in,line)){ if(line.empty())continue; if(header){header=false;continue;} auto c=splitCSV(line); if(c.size()!=7)continue; ClientRow r; int var; if(!toUInt32(c[0],r.pairId))continue; if(!toInt(c[1],var))continue; r.variant=(uint8_t)var; if(!toUInt32(c[2],r.plainSize))continue; if(!toUInt32(c[3],r.encryptedSize))continue; if(!toUInt64(c[4],r.encryptNs))continue; if(!toUInt64(c[5],r.sendNs))continue; if(!toUInt64(c[6],r.sendTsUs))continue; r.parsed=true; rows.push_back(r);} return rows; }
-std::vector<ServerRow> loadServer(const std::string& path){std::ifstream in(path);std::vector<ServerRow> rows; if(!in.is_open()){std::cerr<<"Failed open server: "<<path<<"\n";return rows;} std::string line; bool header=true; while(std::getline(in,line)){ if(line.empty())continue; if(header){header=false;continue;} auto c=splitCSV(line); if(c.size()!=6)continue; ServerRow r; int var; if(!toUInt32(c[0],r.pairId))continue; if(!toInt(c[1],var))continue; r.variant=(uint8_t)var; if(!toUInt32(c[2],r.plainSize))continue; if(!toUInt32(c[3],r.encryptedSize))continue; if(!toUInt64(c[4],r.recvTsUs))continue; if(!toUInt32(c[5],r.payloadBytes))continue; r.parsed=true; rows.push_back(r);} return rows; }
+// -----------------------------------------------------------------------------
+// Parsing helpers
+// -----------------------------------------------------------------------------
+static bool parseUInt32(const std::string& s, uint32_t& v) { try { v = (uint32_t)std::stoul(s); return true; } catch (...) { return false; } }
+static bool parseUInt64(const std::string& s, uint64_t& v) { try { v = (uint64_t)std::stoull(s); return true; } catch (...) { return false; } }
+static bool parseInt(const std::string& s, int& v)       { try { v = std::stoi(s); return true; } catch (...) { return false; } }
 
-void buildPairs(const std::vector<ClientRow>& cRows, const std::vector<ServerRow>& sRows, std::vector<PairMetrics>& out){
-    // Organize by pairId & variant
-    std::unordered_map<uint64_t,ClientRow> cPlain,cEnc; std::unordered_map<uint64_t,ServerRow> sPlain,sEnc;
-    for(auto const& c: cRows){ if(!c.parsed) continue; if(c.variant==0) cPlain[c.pairId]=c; else if(c.variant==1) cEnc[c.pairId]=c; }
-    for(auto const& s: sRows){ if(!s.parsed) continue; if(s.variant==0) sPlain[s.pairId]=s; else if(s.variant==1) sEnc[s.pairId]=s; }
-    // build union of pairIds
-    std::unordered_map<uint64_t,bool> ids; for(auto& kv:cPlain) ids[kv.first]=true; for(auto& kv:cEnc) ids[kv.first]=true; for(auto& kv:sPlain) ids[kv.first]=true; for(auto& kv:sEnc) ids[kv.first]=true;
-    out.reserve(ids.size());
-    for(auto& kv: ids){ uint64_t id=kv.first; PairMetrics pm{}; pm.pairId=(uint32_t)id;
-        bool hcP = cPlain.count(id); bool hcE = cEnc.count(id); bool hsP = sPlain.count(id); bool hsE = sEnc.count(id);
-        if(hcP){ auto &c=cPlain[id]; pm.plainSendTsUs=c.sendTsUs; pm.plainSendNs=c.sendNs; pm.plainSize=c.plainSize; }
-        else pm.invalidFlags |= MISSING_PLAIN_SEND;
-        if(hcE){ auto &c=cEnc[id]; pm.encSendTsUs=c.sendTsUs; pm.encSendNs=c.sendNs; pm.encPlainSize=c.plainSize; pm.encEncryptedSize=c.encryptedSize; pm.encEncryptNs=c.encryptNs; }
-        else pm.invalidFlags |= MISSING_ENC_SEND;
-        if(hsP){ auto &s=sPlain[id]; pm.plainRecvTsUs=s.recvTsUs; }
-        else pm.invalidFlags |= MISSING_PLAIN_RECV;
-        if(hsE){ auto &s=sEnc[id]; pm.encRecvTsUs=s.recvTsUs; }
-        else pm.invalidFlags |= MISSING_ENC_RECV;
-        if(hcP && hsP){ pm.plainLatencyUs = (int64_t)pm.plainRecvTsUs - (int64_t)pm.plainSendTsUs; if(pm.plainLatencyUs < 0) pm.invalidFlags |= NEGATIVE_LAT_PLAIN; }
-        if(hcE && hsE){ pm.encLatencyUs = (int64_t)pm.encRecvTsUs - (int64_t)pm.encSendTsUs; if(pm.encLatencyUs < 0) pm.invalidFlags |= NEGATIVE_LAT_ENC; }
-        if(hcP && hsP){ if(pm.plainSize==0) pm.invalidFlags |= SIZE_MISMATCH_PLAIN; }
-        if(hcE && hsE){ if(pm.encEncryptedSize==0 || pm.encPlainSize==0) pm.invalidFlags |= ENCRYPT_SIZE_INVALID; else if(pm.encEncryptedSize < pm.encPlainSize) pm.invalidFlags |= SIZE_MISMATCH_ENC; if(pm.encEncryptNs==0) pm.invalidFlags |= ZERO_ENCRYPT_TIME; }
-        if(hcP && hcE){ pm.latencyDeltaUs = pm.encLatencyUs - pm.plainLatencyUs; }
-        out.push_back(pm); }
+static Row parseLine(const std::string& line) {
+    Row row; std::stringstream ss(line); std::string idStr, variantStr, tsStr;
+    if (!std::getline(ss, idStr, ',')) return row;
+    if (!std::getline(ss, variantStr, ',')) return row;
+    if (!std::getline(ss, tsStr, ',')) return row;
+    int variantInt = 0;
+    if (!parseUInt32(idStr, row.id)) return row;
+    if (!parseInt(variantStr, variantInt))     return row;
+    if (!parseUInt64(tsStr, row.timestampUs)) return row;
+    row.variant = (uint8_t)variantInt;
+    row.ok = true;
+    return row;
 }
 
-static void detectOutliers(std::vector<PairMetrics>& rows){
-    std::vector<int64_t> plainL, encL, deltas; plainL.reserve(rows.size()); encL.reserve(rows.size()); deltas.reserve(rows.size());
-    for(auto &r: rows){ if(!(r.invalidFlags & (MISSING_PLAIN_SEND|MISSING_PLAIN_RECV|NEGATIVE_LAT_PLAIN)) && r.plainLatencyUs>0) plainL.push_back(r.plainLatencyUs); if(!(r.invalidFlags & (MISSING_ENC_SEND|MISSING_ENC_RECV|NEGATIVE_LAT_ENC)) && r.encLatencyUs>0) encL.push_back(r.encLatencyUs); if(r.invalidFlags==0 && r.plainLatencyUs>0 && r.encLatencyUs>0) deltas.push_back(r.latencyDeltaUs); }
-    auto mark = [](std::vector<PairMetrics>& rows, const std::vector<int64_t>& values, uint32_t flag, auto accessor){ if(values.size()<8) return; std::vector<int64_t> tmp=values; std::nth_element(tmp.begin(), tmp.begin()+tmp.size()/2, tmp.end()); double med=(double)tmp[tmp.size()/2]; std::vector<double> dev; dev.reserve(values.size()); for(auto v: values) dev.push_back(std::abs(v-med)); std::nth_element(dev.begin(), dev.begin()+dev.size()/2, dev.end()); double mad=dev[dev.size()/2]; if(mad<1) mad=1; double thr=6.0*mad; for(auto &r: rows){ double val=(double)accessor(r); if(val>0){ double diff=std::abs(val-med); if(diff>thr) r.invalidFlags |= flag; } } };
-    mark(rows, plainL, OUTLIER_LATENCY_PLAIN, [](const PairMetrics&r){return r.plainLatencyUs;});
-    mark(rows, encL, OUTLIER_LATENCY_ENC, [](const PairMetrics&r){return r.encLatencyUs;});
-    mark(rows, deltas, OUTLIER_DELTA, [](const PairMetrics&r){return r.latencyDeltaUs;});
+// Load client or server CSV into maps
+static void loadCsv(const std::string& path,
+                    std::unordered_map<uint32_t, Row>& plainOut,
+                    std::unordered_map<uint32_t, Row>& transformedOut) {
+    std::ifstream in(path);
+    if (!in.is_open()) return; // silently ignore missing file here
+
+    std::string line; bool header = true;
+    while (std::getline(in, line)) {
+        if (line.empty()) continue;
+        if (header) { header = false; continue; }
+        Row row = parseLine(line);
+        if (!row.ok) continue;
+        if (row.variant == VAR_PLAIN) plainOut[row.id] = row;
+        else if (isTransformed(row.variant)) transformedOut[row.id] = row;
+    }
 }
 
-static void assembleReasons(std::vector<PairMetrics>& rows){ for(auto &r: rows){ std::vector<std::string> rs; if(r.invalidFlags & MISSING_PLAIN_SEND) rs.push_back("missing_plain_send"); if(r.invalidFlags & MISSING_ENC_SEND) rs.push_back("missing_enc_send"); if(r.invalidFlags & MISSING_PLAIN_RECV) rs.push_back("missing_plain_recv"); if(r.invalidFlags & MISSING_ENC_RECV) rs.push_back("missing_enc_recv"); if(r.invalidFlags & SIZE_MISMATCH_PLAIN) rs.push_back("size_mismatch_plain"); if(r.invalidFlags & SIZE_MISMATCH_ENC) rs.push_back("size_mismatch_enc"); if(r.invalidFlags & ENCRYPT_SIZE_INVALID) rs.push_back("encrypt_size_invalid"); if(r.invalidFlags & NEGATIVE_LAT_PLAIN) rs.push_back("negative_latency_plain"); if(r.invalidFlags & NEGATIVE_LAT_ENC) rs.push_back("negative_latency_enc"); if(r.invalidFlags & ZERO_ENCRYPT_TIME) rs.push_back("zero_encrypt_time"); if(r.invalidFlags & OUTLIER_LATENCY_PLAIN) rs.push_back("outlier_latency_plain"); if(r.invalidFlags & OUTLIER_LATENCY_ENC) rs.push_back("outlier_latency_enc"); if(r.invalidFlags & OUTLIER_DELTA) rs.push_back("outlier_delta"); r.reasons.clear(); for(size_t i=0;i<rs.size();++i){ if(i) r.reasons+=';'; r.reasons+=rs[i]; } } }
-
-struct Stats { double count{}; double min{}; double max{}; double mean{}; double median{}; double stddev{}; };
-static Stats computeStats(const std::vector<int64_t>& v){ Stats s; if(v.empty()) return s; s.count=(double)v.size(); s.min=*std::min_element(v.begin(),v.end()); s.max=*std::max_element(v.begin(),v.end()); double sum=0; for(auto x:v) sum+=x; s.mean=sum/s.count; std::vector<int64_t> tmp=v; std::nth_element(tmp.begin(), tmp.begin()+tmp.size()/2, tmp.end()); s.median=(double)tmp[tmp.size()/2]; double acc=0; for(auto x:v){ double d=x - s.mean; acc+=d*d;} s.stddev=std::sqrt(acc/s.count); return s; }
-
-static void writeOutputs(const std::vector<PairMetrics>& rows){ std::ofstream valid("paired_filtered.csv"), invalid("paired_invalid.csv"), summary("paired_summary.txt"); if(!valid.is_open()||!invalid.is_open()){ std::cerr<<"Failed open output files"<<std::endl; return;} valid<<"pair_id,plain_latency_us,enc_latency_us,latency_delta_us,plain_size,enc_plain_size,enc_encrypted_size,encrypt_ns,plain_send_ns,enc_send_ns\n"; invalid<<"pair_id,plain_latency_us,enc_latency_us,latency_delta_us,invalid_flags,reasons\n"; std::vector<int64_t> plainL, encL, deltaL; for(auto &r: rows){ if(r.invalidFlags==0){ valid<<r.pairId<<","<<r.plainLatencyUs<<","<<r.encLatencyUs<<","<<r.latencyDeltaUs<<","<<r.plainSize<<","<<r.encPlainSize<<","<<r.encEncryptedSize<<","<<r.encEncryptNs<<","<<r.plainSendNs<<","<<r.encSendNs<<"\n"; if(r.plainLatencyUs>0) plainL.push_back(r.plainLatencyUs); if(r.encLatencyUs>0) encL.push_back(r.encLatencyUs); if(r.latencyDeltaUs) deltaL.push_back(r.latencyDeltaUs);} else { invalid<<r.pairId<<","<<r.plainLatencyUs<<","<<r.encLatencyUs<<","<<r.latencyDeltaUs<<","<<r.invalidFlags<<","<<r.reasons<<"\n"; } } Stats sp=computeStats(plainL), se=computeStats(encL), sd=computeStats(deltaL); if(summary.is_open()){ summary<<"Valid pairs: "<<(int)sp.count<<"\n"; summary<<"Plain latency us: min="<<sp.min<<" max="<<sp.max<<" mean="<<sp.mean<<" median="<<sp.median<<" stddev="<<sp.stddev<<"\n"; summary<<"Encrypted latency us: min="<<se.min<<" max="<<se.max<<" mean="<<se.mean<<" median="<<se.median<<" stddev="<<se.stddev<<"\n"; summary<<"Delta (enc-plain) us: min="<<sd.min<<" max="<<sd.max<<" mean="<<sd.mean<<" median="<<sd.median<<" stddev="<<sd.stddev<<"\n"; summary<<"Mean overhead (enc - plain): "<<se.mean - sp.mean<<" us\n"; }
+// -----------------------------------------------------------------------------
+// Core processing
+// -----------------------------------------------------------------------------
+static void buildTestData(int testIndex, TestData& data) {
+    const std::string clientPath = "data/client_metrics_t" + std::to_string(testIndex) + ".csv";
+    const std::string serverPath = "data/server_metrics_t" + std::to_string(testIndex) + ".csv";
+    if (!std::filesystem::exists(clientPath) || !std::filesystem::exists(serverPath)) return;
+    loadCsv(clientPath, data.clientPlainRows,  data.clientTransformedRows);
+    loadCsv(serverPath, data.serverPlainRows, data.serverTransformedRows);
 }
 
-int main(int argc,char* argv[]){ std::string clientPath="client_metrics.csv", serverPath="server_metrics.csv"; if(argc>1) clientPath=argv[1]; if(argc>2) serverPath=argv[2]; std::cout<<"Loading client from "<<clientPath<<"\n"; auto cRows=loadClient(clientPath); std::cout<<"Client rows: "<<cRows.size()<<"\n"; std::cout<<"Loading server from "<<serverPath<<"\n"; auto sRows=loadServer(serverPath); std::cout<<"Server rows: "<<sRows.size()<<"\n"; std::vector<PairMetrics> pairs; buildPairs(cRows,sRows,pairs); detectOutliers(pairs); assembleReasons(pairs); writeOutputs(pairs); std::cout<<"Analysis complete. See paired_filtered.csv, paired_invalid.csv, paired_summary.txt\n"; return 0; }
+static void pairRows(const TestData& data,
+                     std::vector<PairMetrics>& validPairs,
+                     std::vector<InvalidPair>& invalidPairs) {
+    // Iterate client plain rows as anchor
+    for (const auto& clientPlainEntry : data.clientPlainRows) {
+        uint32_t id = clientPlainEntry.first;
+        auto clientPlainIt       = data.clientPlainRows.find(id);
+        auto serverPlainIt       = data.serverPlainRows.find(id);
+        auto clientTransformedIt = data.clientTransformedRows.find(id);
+        auto serverTransformedIt = data.serverTransformedRows.find(id);
+
+        bool missing = (clientPlainIt == data.clientPlainRows.end() ||
+                        serverPlainIt == data.serverPlainRows.end() ||
+                        clientTransformedIt == data.clientTransformedRows.end() ||
+                        serverTransformedIt == data.serverTransformedRows.end());
+        if (missing) {
+            invalidPairs.push_back({ id, "missing_counterpart" });
+            continue;
+        }
+
+        uint64_t plainLatencyUs = (serverPlainIt->second.timestampUs >= clientPlainIt->second.timestampUs)
+                                ? (serverPlainIt->second.timestampUs - clientPlainIt->second.timestampUs) : 0;
+        uint64_t transformedLatencyUs = (serverTransformedIt->second.timestampUs >= clientTransformedIt->second.timestampUs)
+                                      ? (serverTransformedIt->second.timestampUs - clientTransformedIt->second.timestampUs) : 0;
+        if (plainLatencyUs == 0 || transformedLatencyUs == 0) {
+            invalidPairs.push_back({ id, "non_positive_latency" });
+            continue;
+        }
+        int64_t deltaLatencyUs = (int64_t)transformedLatencyUs - (int64_t)plainLatencyUs;
+        validPairs.push_back({ id, plainLatencyUs, transformedLatencyUs, deltaLatencyUs, clientTransformedIt->second.variant });
+    }
+}
+
+static void writePerTestFiles(int testIndex,
+                              const std::vector<PairMetrics>& validPairs,
+                              const std::vector<InvalidPair>& invalidPairs) {
+    // Valid pairs
+    {
+        std::ofstream out("paired_filtered_t" + std::to_string(testIndex) + ".csv");
+        if (out.is_open()) {
+            out << "pair_id,plain_latency_us,trans_latency_us,latency_delta_us,variant\n";
+            for (const auto& pairMetrics : validPairs) {
+                out << pairMetrics.id << ','
+                    << pairMetrics.plainLatencyUs << ','
+                    << pairMetrics.transformedLatencyUs << ','
+                    << pairMetrics.deltaLatencyUs << ','
+                    << (int)pairMetrics.transformedVariant << '\n';
+            }
+        }
+    }
+    // Invalid pairs
+    {
+        std::ofstream out("paired_invalid_t" + std::to_string(testIndex) + ".csv");
+        if (out.is_open()) {
+            out << "pair_id,reason\n";
+            for (const auto& invalid : invalidPairs) {
+                out << invalid.id << ',' << invalid.reason << '\n';
+            }
+        }
+    }
+}
+
+static void writeSummaryLine(std::ofstream& summary,
+                             int testIndex,
+                             const std::vector<PairMetrics>& validPairs) {
+    double sumPlainLatency = 0.0, sumTransformedLatency = 0.0;
+    int sampleCount = 0;
+    for (const auto& pairMetrics : validPairs) {
+        sumPlainLatency       += (double)pairMetrics.plainLatencyUs;
+        sumTransformedLatency += (double)pairMetrics.transformedLatencyUs;
+        ++sampleCount;
+    }
+    double meanPlainLatency       = sampleCount ? (sumPlainLatency / sampleCount) : 0.0;
+    double meanTransformedLatency = sampleCount ? (sumTransformedLatency / sampleCount) : 0.0;
+
+    summary << "Test " << testIndex << ": valid_pairs=" << validPairs.size() << '\n'
+            << "  Mean plain latency us=" << meanPlainLatency << '\n'
+            << "  Mean transformed latency us=" << meanTransformedLatency << '\n'
+            << "  Mean delta (trans - plain) us=" << (meanTransformedLatency - meanPlainLatency) << "\n\n";
+}
+
+// -----------------------------------------------------------------------------
+// Entry point
+// -----------------------------------------------------------------------------
+int main(int argc, char* argv[]) {
+    int testsToProcess = 0;
+    if (argc > 1) { try { testsToProcess = std::stoi(argv[1]); } catch (...) {} }
+    if (testsToProcess <= 0) {
+        for (int i = 1; i < 10000; ++i) {
+            if (std::filesystem::exists("data/client_metrics_t" + std::to_string(i) + ".csv")) testsToProcess = i; else break;
+        }
+    }
+    if (testsToProcess <= 0) {
+        std::cerr << "No test files found." << std::endl;
+        return 1;
+    }
+
+    std::ofstream summary("paired_summary.txt");
+    if (!summary.is_open()) {
+        std::cerr << "Cannot open summary file" << std::endl;
+        return 1;
+    }
+
+    for (int testIndex = 1; testIndex <= testsToProcess; ++testIndex) {
+        TestData testData;
+        buildTestData(testIndex, testData);
+
+        std::vector<PairMetrics> validPairs;
+        std::vector<InvalidPair> invalidPairs;
+        validPairs.reserve(testData.clientPlainRows.size());
+        invalidPairs.reserve(16);
+
+        pairRows(testData, validPairs, invalidPairs);
+        writePerTestFiles(testIndex, validPairs, invalidPairs);
+        writeSummaryLine(summary, testIndex, validPairs);
+    }
+
+    std::cout << "Analysis complete." << std::endl;
+    return 0;
+}
